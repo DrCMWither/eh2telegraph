@@ -8,7 +8,7 @@ The original contributors of the upstream project are not associated with this f
 
 Bot that automatically downloads image sets from EH/EX/NH and uploads them to Telegraph.
 
-This code is only guaranteed to work correctly on MacOS (partial functionality) and Linux.
+This code is not only guaranteed to work correctly on MacOS (partial functionality) and Linux, but also guaranteed to work in Windows.
 
 ## Deployment Guidelines
 1. Install Docker and docker-compose.

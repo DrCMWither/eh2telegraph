@@ -12,6 +12,9 @@ proxy:
   endpoint: https://proxy.xxx.workers.dev/
   authorization: xxx
 
+image_proxy:
+  base_url: https://proxy.xxx.workers.dev/
+
 http:
   ipv6_prefix:
 
@@ -25,3 +28,4 @@ worker_kv:
   token: xxx
   cache_size: 10240
   expire_sec: 5184000 # 60 days
+

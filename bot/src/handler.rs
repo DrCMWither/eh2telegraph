@@ -17,15 +17,17 @@ use teloxide::{
     prelude::*,
     utils::{
         command::BotCommands,
-        markdown::{code_inline, escape},
+        markdown::{code_inline},
     },
 };
+
 use tracing::{info, trace};
 
-use crate::{ok_or_break, util::PrettyChat};
+use crate::{ok_or_break, util::PrettyChat, util::esc};
 
 const MIN_SIMILARITY: u8 = 70;
 const MIN_SIMILARITY_PRIVATE: u8 = 50;
+
 
 #[derive(BotCommands, Clone)]
 #[command(
@@ -71,6 +73,35 @@ impl<C> Handler<C>
 where
     C: KVStorage<String> + Send + Sync + 'static,
 {
+
+    async fn spawn_sync_reply(
+        self: Arc<Self>,
+        bot: DefaultParseMode<Bot>,
+        msg: Message,
+        url: String,
+        source: &'static str,
+    ) -> ControlFlow<()> {
+        info!(
+            "[{source}] receive sync request from {:?} for {url}",
+            PrettyChat(&msg.chat)
+        );
+
+        let sent: Message = ok_or_break!(
+            bot.send_message(msg.chat.id, esc(&format!("Syncing url {url}")))
+                .reply_to_message_id(msg.id)
+                .await
+        );
+
+        tokio::spawn(async move {
+            let text = self.sync_response(&url).await;
+            if let Err(e) = bot.edit_message_text(sent.chat.id, sent.id, text).await {
+                tracing::error!("[{source}] failed to edit sync message: {e}");
+            }
+        });
+
+        ControlFlow::Break(())
+    }
+
     pub fn new(synchronizer: Synchronizer<C>, admins: HashSet<i64>) -> Self {
         Self {
             synchronizer,
@@ -92,13 +123,13 @@ where
         match command {
             Command::Help => {
                 let _ = bot
-                    .send_message(msg.chat.id, escape(&Command::descriptions().to_string()))
+                    .send_message(msg.chat.id, esc(&Command::descriptions().to_string()))
                     .reply_to_message_id(msg.id)
                     .await;
             }
             Command::Version => {
                 let _ = bot
-                    .send_message(msg.chat.id, escape(crate::version::VERSION))
+                    .send_message(msg.chat.id, esc(crate::version::VERSION))
                     .reply_to_message_id(msg.id)
                     .await;
             }
@@ -117,26 +148,15 @@ where
             Command::Sync(url) => {
                 if url.is_empty() {
                     let _ = bot
-                        .send_message(msg.chat.id, escape("Usage: /sync url"))
+                        .send_message(msg.chat.id, esc("Usage: /sync url"))
                         .reply_to_message_id(msg.id)
                         .await;
                     return ControlFlow::Break(());
                 }
 
-                info!(
-                    "[cmd handler] receive sync request from {:?} for {url}",
-                    PrettyChat(&msg.chat)
-                );
-                let msg: Message = ok_or_break!(
-                    bot.send_message(msg.chat.id, escape(&format!("Syncing url {url}")))
-                        .reply_to_message_id(msg.id)
-                        .await
-                );
-                tokio::spawn(async move {
-                    let _ = bot
-                        .edit_message_text(msg.chat.id, msg.id, self.sync_response(&url).await)
-                        .await;
-                });
+                return self
+                    .spawn_sync_reply(bot, msg, url, "cmd handler")
+                    .await;
             }
         };
 
@@ -151,13 +171,20 @@ where
     ) -> ControlFlow<()> {
         match command {
             AdminCommand::Delete(key) => {
-                tokio::spawn(async move {
-                    let _ = self.synchronizer.delete_cache(&key).await;
-                    let _ = bot
-                        .send_message(msg.chat.id, escape(&format!("Key {key} deleted.")))
-                        .reply_to_message_id(msg.id)
-                        .await;
-                });
+                match self.synchronizer.delete_cache(&key).await {
+                    Ok(_) => {
+                        let _ = bot
+                            .send_message(msg.chat.id, esc(&format!("Key {key} deleted.")))
+                            .reply_to_message_id(msg.id)
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = bot
+                            .send_message(msg.chat.id, esc(&format!("Failed to delete key {key}: {e}")))
+                            .reply_to_message_id(msg.id)
+                            .await;
+                    }
+                }
                 ControlFlow::Break(())
             }
         }
@@ -192,29 +219,9 @@ where
         };
 
         if let Some(url) = maybe_link {
-            info!(
-                "[text handler] receive sync request from {:?} for {url}",
-                PrettyChat(&msg.chat)
-            );
-            let msg: Message = ok_or_break!(
-                bot.send_message(msg.chat.id, escape(&format!("Syncing url {url}")))
-                    .reply_to_message_id(msg.id)
-                    .await
-            );
-            tokio::spawn(async move {
-                let text = self.sync_response(&url).await;
-                match bot
-                    .inner()
-                    .edit_message_text(msg.chat.id, msg.id, text)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!("failed to edit sync message: {}", e);
-                    }
-                }
-            });
-            return ControlFlow::Break(());
+            return self
+                .spawn_sync_reply(bot, msg, url, "text handler")
+                .await;
         }
 
         // fallback to the next branch
@@ -231,9 +238,9 @@ where
         for entry in caption_entities.map(|x| x.iter()).into_iter().flatten() {
             let url = match &entry.kind {
                 teloxide::types::MessageEntityKind::Url => {
-                    let raw = msg
-                        .caption()
-                        .expect("Url MessageEntry found but caption is None");
+                    let Some(raw) = msg.caption() else {
+                        return ControlFlow::Continue(());
+                    };
                     let encoded: Vec<_> = raw
                         .encode_utf16()
                         .skip(entry.offset)
@@ -257,24 +264,9 @@ where
         }
 
         match final_url {
-            Some(url) => {
-                info!(
-                    "[caption handler] receive sync request from {:?} for {url}",
-                    PrettyChat(&msg.chat)
-                );
-                let msg: Message = ok_or_break!(
-                    bot.send_message(msg.chat.id, escape(&format!("Syncing url {url}")))
-                        .reply_to_message_id(msg.id)
-                        .await
-                );
-                let url = url.to_string();
-                tokio::spawn(async move {
-                    let _ = bot
-                        .edit_message_text(msg.chat.id, msg.id, self.sync_response(&url).await)
-                        .await;
-                });
-                ControlFlow::Break(())
-            }
+            Some(url) => self
+                .spawn_sync_reply(bot, msg, url, "caption handler")
+                .await,
             None => ControlFlow::Continue(()),
         }
     }
@@ -284,7 +276,7 @@ where
         bot: DefaultParseMode<Bot>,
         msg: Message,
     ) -> ControlFlow<()> {
-        let first_photo = match msg.photo().and_then(|x| x.first()) {
+        let first_photo = match msg.photo().and_then(|x| x.last()) {
             Some(p) => p,
             None => {
                 return ControlFlow::Continue(());
@@ -330,25 +322,12 @@ where
                 return ControlFlow::Continue(());
             }
         };
-
         info!(
-            "[photo handler] receive sync request from {:?} for {url} with similarity {sim}",
+            "[photo handler] image matched {:?} for {url} with similarity {sim}",
             PrettyChat(&msg.chat)
         );
 
-        if let Ok(msg) = bot
-            .send_message(msg.chat.id, escape(&format!("Syncing url {url}")))
-            .reply_to_message_id(msg.id)
-            .await
-        {
-            tokio::spawn(async move {
-                let _ = bot
-                    .edit_message_text(msg.chat.id, msg.id, self.sync_response(&url).await)
-                    .await;
-            });
-        }
-
-        ControlFlow::Break(())
+        self.spawn_sync_reply(bot, msg, url, "photo handler").await
     }
 
     pub async fn respond_default(
@@ -358,7 +337,7 @@ where
     ) -> ControlFlow<()> {
         if msg.chat.is_private() {
             ok_or_break!(
-                bot.send_message(msg.chat.id, escape("Unrecognized message."))
+                bot.send_message(msg.chat.id, esc("Unrecognized message."))
                     .reply_to_message_id(msg.id)
                     .await
             );
@@ -369,39 +348,56 @@ where
     }
 
     async fn sync_response(&self, url: &str) -> String {
-    self.single_flight
-        .work(url, || async {
-            match self.route_sync(url).await {
-                Ok(result) => {
-                    let title_line = result.title.map(|t| format!("Title: {}\n", t)).unwrap_or_default();
-                    let authors_line = result.authors
-                        .filter(|xs| !xs.is_empty())
-                        .map(|xs| format!("Authors: {}\n", xs.join(", ")))
-                        .unwrap_or_default();
-                    let tags_line = result.tags
-                        .filter(|xs| !xs.is_empty())
-                        .map(|xs| {
-                            let shown = xs.iter().take(12)
-                                .map(|t| format!("#{}", t.replace(' ', "_")))
-                                .collect::<Vec<_>>();
-                            format!("Tags: {}\n", shown.join(" "))
-                        })
-                        .unwrap_or_default();
-                    format!(
-                        "Sync to telegraph finished\n{}{}{}URL: {}",
-                        title_line,
-                        authors_line,
-                        tags_line,
-                        result.page_url
-                    )
+        self.single_flight
+            .work(url, || async {
+                match self.route_sync(url).await {
+                    Ok(result) => {
+                        let title_line = result
+                            .title
+                            .map(|t| format!("Title: {}\n", esc(t)))
+                            .unwrap_or_default();
+
+                        let authors_line = result
+                            .authors
+                            .filter(|xs| !xs.is_empty())
+                            .map(|xs| {
+                                let authors = xs
+                                    .into_iter()
+                                    .map(|a| esc(a))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("Authors: {}\n", authors)
+                            })
+                            .unwrap_or_default();
+
+                        let tags_line = result
+                            .tags
+                            .filter(|xs| !xs.is_empty())
+                            .map(|xs| {
+                                let shown = xs
+                                    .iter()
+                                    .take(12)
+                                    .map(|t| format!("#{}", esc(t.replace(' ', "_"))))
+                                    .collect::<Vec<_>>();
+                                format!("Tags: {}\n", shown.join(" "))
+                            })
+                            .unwrap_or_default();
+
+                        format!(
+                            "Sync to telegraph finished\n{}{}{}URL: {}",
+                            title_line,
+                            authors_line,
+                            tags_line,
+                            esc(result.page_url)
+                        )
+                    }
+                    Err(e) => {
+                        format!("Sync to telegraph failed: {}", esc(e.to_string()))
+                    }
                 }
-                Err(e) => {
-                    format!("Sync to telegraph failed: {}", escape(&e.to_string()))
-                }
-            }
-        })
-        .await
-}
+            })
+            .await
+    }
 
     async fn route_sync(&self, url: &str) -> anyhow::Result<SyncResult> {
         let u = Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid url"))?;
@@ -409,6 +405,8 @@ where
         let path = u.path().to_string();
 
         // TODO: use macro to generate them
+        // Lilia's crit: DO NOT USE MACRO! use host normalization.
+
         #[allow(clippy::single_match)]
         match host {
             "e-hentai.org" => {
