@@ -22,7 +22,7 @@ use teloxide::{
 };
 
 use tracing::{info, trace};
-
+use tokio::time::{timeout, Duration};
 use crate::{ok_or_break, util::PrettyChat, util::esc};
 
 const MIN_SIMILARITY: u8 = 70;
@@ -86,16 +86,45 @@ where
             PrettyChat(&msg.chat)
         );
 
-        let sent: Message = ok_or_break!(
+        let sent: Message = match timeout(Duration::from_secs(20), async {
             bot.send_message(msg.chat.id, esc(&format!("Syncing url {url}")))
                 .reply_to_message_id(msg.id)
                 .await
-        );
+        })
+        .await
+        {
+            Ok(Ok(sent)) => sent,
+            Ok(Err(e)) => {
+                tracing::error!("[{source}] failed to send syncing message: {e}");
+                return ControlFlow::Break(());
+            }
+            Err(_) => {
+                tracing::error!("[{source}] timeout while sending syncing message for {url}");
+                return ControlFlow::Break(());
+            }
+        };
 
         tokio::spawn(async move {
+            tracing::info!("[{source}] spawned sync task for {url}");
+        
             let text = self.sync_response(&url).await;
-            if let Err(e) = bot.edit_message_text(sent.chat.id, sent.id, text).await {
-                tracing::error!("[{source}] failed to edit sync message: {e}");
+        
+            tracing::info!("[{source}] sync_response returned for {url}, editing message");
+        
+            match timeout(Duration::from_secs(20), async {
+                bot.edit_message_text(sent.chat.id, sent.id, text).await
+            })
+            .await
+            {
+                Ok(Ok(_)) => {
+                    tracing::info!("[{source}] edited sync message for {url}");
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("[{source}] failed to edit sync message for {url}: {e}");
+                }
+                Err(_) => {
+                    tracing::error!("[{source}] timeout while editing sync message for {url}");
+                }
             }
         });
 
@@ -405,7 +434,7 @@ where
         let path = u.path().to_string();
 
         // TODO: use macro to generate them
-        // Lilia's crit: DO NOT USE MACRO! use host normalization.
+        // Lilia's crit: Keep routing explicit. normalize hosts, instead of introducing a macro.
 
         #[allow(clippy::single_match)]
         match host {

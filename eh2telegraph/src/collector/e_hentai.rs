@@ -1,33 +1,44 @@
-/// nhentai collector.
+/// e-hentai collector.
 /// Host matching: e-hentai.org
-use crate::{
-    http_client::{GhostClient, GhostClientBuilder},
-    stream::AsyncStream,
-    util::match_first_group,
-    util::{get_bytes, get_string},
-};
 use again::RetryPolicy;
 use ipnet::Ipv6Net;
 use regex::Regex;
 use reqwest::header;
-
 use std::time::Duration;
+use tokio::time::timeout;
+
+use crate::{
+    http_client::{GhostClient, GhostClientBuilder},
+    stream::AsyncStream,
+    util::{get_bytes, get_string, match_first_group},
+};
 
 use super::{
     utils::paged::{PageFormatter, PageIndicator, Paged},
     AlbumMeta, Collector, ImageData, ImageMeta,
 };
 
+const HOST: &str = "e-hentai.org";
+const COOKIE_NW: &str = "nw=1";
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const IMAGE_PAGE_TIMEOUT: Duration = Duration::from_secs(20);
+const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(40);
+
 lazy_static::lazy_static! {
-    static ref PAGE_RE: Regex = Regex::new(r#"<a href="(https://e-hentai\.org/s/\w+/[\w-]+)">"#).unwrap();
-    static ref IMG_RE: Regex = Regex::new(r#"<img id="img" src="(.*?)""#).unwrap();
-    static ref TITLE_RE: Regex = Regex::new(r#"<h1 id="gn">(.*?)</h1>"#).unwrap();
+    static ref PAGE_RE: Regex =
+        Regex::new(r#"<a\s+href="(https://e-hentai\.org/s/[^"]+)""#).unwrap();
+
+    static ref IMG_RE: Regex =
+        Regex::new(r#"<img\s+id="img"\s+src="([^"]+)""#).unwrap();
+
+    static ref TITLE_RE: Regex =
+        Regex::new(r#"<h1\s+id="gn">(.*?)</h1>"#).unwrap();
 
     static ref RETRY_POLICY: RetryPolicy = RetryPolicy::fixed(Duration::from_millis(200))
         .with_max_retries(5)
         .with_jitter(true);
 }
-const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default)]
 pub struct EHCollector {
@@ -37,36 +48,60 @@ pub struct EHCollector {
 
 impl EHCollector {
     pub fn new(prefix: Option<Ipv6Net>) -> Self {
-        let mut request_headers = header::HeaderMap::new();
-        request_headers.insert(
-            header::COOKIE,
-            header::HeaderValue::from_str("nw=1").unwrap(),
-        );
-
         Self {
-            client: GhostClientBuilder::default()
-                .with_default_headers(request_headers)
-                .with_cf_resolve(&["e-hentai.org"])
-                .build(prefix),
-            raw_client: reqwest::Client::builder().timeout(TIMEOUT).build().unwrap(),
+            client: ghost_client_builder().build(prefix),
+            raw_client: raw_client(),
         }
     }
 
     pub fn new_from_config() -> anyhow::Result<Self> {
-        let mut request_headers = header::HeaderMap::new();
-        request_headers.insert(
-            header::COOKIE,
-            header::HeaderValue::from_str("nw=1").unwrap(),
-        );
-
         Ok(Self {
-            client: GhostClientBuilder::default()
-                .with_default_headers(request_headers)
-                .with_cf_resolve(&["e-hentai.org"])
-                .build_from_config()?,
-            raw_client: reqwest::Client::builder().timeout(TIMEOUT).build().unwrap(),
+            client: ghost_client_builder().build_from_config()?,
+            raw_client: raw_client(),
         })
     }
+}
+
+fn ghost_client_builder() -> GhostClientBuilder {
+    let mut request_headers = header::HeaderMap::new();
+    request_headers.insert(header::COOKIE, header::HeaderValue::from_static(COOKIE_NW));
+
+    GhostClientBuilder::default()
+        .with_default_headers(request_headers)
+        .with_cf_resolve(&[HOST])
+}
+
+fn raw_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("failed to build e-hentai raw client")
+}
+
+fn parse_gallery_path(path: &str) -> anyhow::Result<(String, String)> {
+    let mut parts = path.trim_matches('/').split('/');
+
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("g"), Some(album_id), Some(album_token), None)
+            if !album_id.is_empty() && !album_token.is_empty() =>
+        {
+            Ok((album_id.to_string(), album_token.to_string()))
+        }
+        _ => Err(anyhow::anyhow!(
+            "invalid input path({path}), gallery url is expected, like https://e-hentai.org/g/2127986/da1deffea5"
+        )),
+    }
+}
+
+fn collect_image_page_links(gallery_pages: &[String]) -> Vec<String> {
+    gallery_pages
+        .iter()
+        .flat_map(|page| {
+            PAGE_RE
+                .captures_iter(page)
+                .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        })
+        .collect()
 }
 
 impl Collector for EHCollector {
@@ -83,47 +118,53 @@ impl Collector for EHCollector {
         &self,
         path: String,
     ) -> Result<(AlbumMeta, Self::ImageStream), Self::FetchError> {
-        // normalize url
-        let mut parts = path.trim_matches(|c| c == '/').split('/');
-        let g = parts.next();
-        let album_id = parts.next();
-        let album_token = parts.next();
-        let (album_id, album_token) = match (g, album_id, album_token) {
-            (Some("g"), Some(album_id), Some(album_token)) => (album_id, album_token),
-            _ => {
-                return Err(anyhow::anyhow!("invalid input path({path}), gallery url is expected(like https://e-hentai.org/g/2127986/da1deffea5)"));
-            }
-        };
-        let url = format!("https://e-hentai.org/g/{album_id}/{album_token}");
-        tracing::info!("[e-hentai] process {url}");
+        let (album_id, album_token) = parse_gallery_path(&path)?;
+        let original_url = format!("https://{HOST}/g/{album_id}/{album_token}");
 
-        // clone client to force changing ip
+        tracing::info!("[e-hentai] process {original_url}");
+
+        // Clone client to force changing / refreshing outbound identity if GhostClient supports it.
         let client = self.client.clone();
-        let mut paged = Paged::new(0, EHPageIndicator { base: url.clone() });
-        let gallery_pages = paged.pages(&client).await?;
 
-        // Since paged returns at least one page, we can safely get it.
-        let title = match_first_group(&TITLE_RE, &gallery_pages[0])
-            .map(|s| s.to_string())
+        let mut paged = Paged::new(
+            0,
+            EHPageIndicator {
+                base: original_url.clone(),
+            },
+        );
+
+        tracing::info!("[e-hentai] sending gallery metadata request: {original_url}");
+
+        let gallery_pages = timeout(REQUEST_TIMEOUT, paged.pages(&client))
+            .await
+            .map_err(|_| anyhow::anyhow!("e-hentai gallery page request timed out"))??;
+
+        tracing::info!("[e-hentai] gallery pages received: {}", gallery_pages.len());
+
+        let first_page = gallery_pages
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("empty gallery page response"))?;
+
+        let title = match_first_group(&TITLE_RE, first_page)
+            .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("e-hentai-{album_id}"));
 
-        let mut image_page_links = Vec::new();
-        for gallery_page in gallery_pages.iter() {
-            PAGE_RE.captures_iter(gallery_page).for_each(|c| {
-                let matching = c.get(1).expect("regexp is matched but no group 1 found");
-                image_page_links.push(matching.as_str().to_string());
-            });
-        }
+        let image_page_links = collect_image_page_links(&gallery_pages);
 
         if image_page_links.is_empty() {
             return Err(anyhow::anyhow!(
-                "invalid url, maybe resource has been deleted."
+                "invalid url, maybe resource has been deleted"
             ));
         }
 
+        tracing::info!(
+            "[e-hentai] image page links collected: {}",
+            image_page_links.len()
+        );
+
         Ok((
             AlbumMeta {
-                link: url,
+                link: original_url,
                 name: title,
                 class: None,
                 description: None,
@@ -148,42 +189,62 @@ pub struct EHImageStream {
 
 impl EHImageStream {
     async fn load_image(
-        client: &GhostClient,
-        raw_client: &reqwest::Client,
-        link: String,
+        client: GhostClient,
+        raw_client: reqwest::Client,
+        image_page_link: String,
     ) -> anyhow::Result<(ImageMeta, ImageData)> {
-        let content = RETRY_POLICY
-            .retry(|| async { get_string(client, &link).await })
-            .await?;
+        let content = timeout(
+            IMAGE_PAGE_TIMEOUT,
+            RETRY_POLICY.retry(|| async { get_string(&client, &image_page_link).await }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("e-hentai image page request timed out: {image_page_link}"))??;
+
         let img_url = match_first_group(&IMG_RE, &content)
-            .ok_or_else(|| anyhow::anyhow!("unable to find image in page"))?;
-        let image_data = RETRY_POLICY
-            .retry(|| async { get_bytes(raw_client, img_url).await })
-            .await?;
+            .ok_or_else(|| anyhow::anyhow!("unable to find image in page: {image_page_link}"))?
+            .to_string();
+
+        let image_data = timeout(
+            IMAGE_DOWNLOAD_TIMEOUT,
+            RETRY_POLICY.retry(|| async { get_bytes(&raw_client, &img_url).await }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("e-hentai image download timed out: {img_url}"))??;
 
         tracing::trace!(
-            "download e-hentai image with size {}, link: {link}",
+            "download e-hentai image with size {}, page: {image_page_link}",
             image_data.len()
         );
-        let meta = ImageMeta {
-            id: link,
-            url: img_url.to_string(),
-            description: None,
-        };
-        Ok((meta, image_data))
+
+        Ok((
+            ImageMeta {
+                id: image_page_link,
+                url: img_url,
+                description: None,
+            },
+            image_data,
+        ))
     }
 }
 
 impl AsyncStream for EHImageStream {
     type Item = anyhow::Result<(ImageMeta, ImageData)>;
-
     type Future = impl std::future::Future<Output = Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
-        let link = self.image_page_links.next()?;
+        let image_page_link = self.image_page_links.next()?;
         let client = self.client.clone();
         let raw_client = self.raw_client.clone();
-        Some(async move { Self::load_image(&client, &raw_client, link).await })
+
+        Some(async move {
+            match EHImageStream::load_image(client, raw_client, image_page_link.clone()).await {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    tracing::error!("e-hentai image failed: {image_page_link}: {e}");
+                    Err(e)
+                }
+            }
+        })
     }
 
     #[inline]
@@ -204,11 +265,12 @@ impl PageFormatter for EHPageIndicator {
 
 impl PageIndicator for EHPageIndicator {
     fn is_last_page(&self, content: &str, next_page: usize) -> bool {
-        let html = format!(
-            "<a href=\"{}/?p={}\" onclick=\"return false\">",
+        let disabled_next = format!(
+            r#"<a href="{}/?p={}" onclick="return false">"#,
             self.base, next_page
         );
-        !content.contains(&html)
+
+        !content.contains(&disabled_next)
     }
 }
 
@@ -220,13 +282,15 @@ mod tests {
     #[tokio::test]
     async fn demo() {
         let collector = EHCollector {
-            raw_client: Default::default(),
+            raw_client: raw_client(),
             client: Default::default(),
         };
+
         let (album, mut image_stream) = collector
             .fetch("/g/2122174/fd2525031e".to_string())
             .await
             .unwrap();
+
         println!("album: {album:?}");
 
         let maybe_first_image = image_stream.next().unwrap().await;
@@ -236,18 +300,28 @@ mod tests {
         }
     }
 
-    #[ignore]
+    #[test]
+    fn parse_gallery_path_accepts_valid_path() {
+        let (id, token) = parse_gallery_path("/g/2122174/fd2525031e").unwrap();
+        assert_eq!(id, "2122174");
+        assert_eq!(token, "fd2525031e");
+    }
+
+    #[test]
+    fn parse_gallery_path_rejects_invalid_path() {
+        assert!(parse_gallery_path("/gallery/2122174/fd2525031e").is_err());
+        assert!(parse_gallery_path("/g/2122174").is_err());
+        assert!(parse_gallery_path("/g/2122174/fd2525031e/extra").is_err());
+    }
+
     #[test]
     fn regex_match() {
-        // test page: https://e-hentai.org/g/2122174/fd2525031e
-        let r = Regex::new(r#"<a href="(https://e-hentai\.org/s/\w+/[\w-]+)">"#).unwrap();
         let h = r#"<div class="gdtm" style="height:170px"><div style="margin:1px auto 0; width:100px; height:140px; background:transparent url(https://ehgt.org/m/002122/2122174-00.jpg) -600px 0 no-repeat"><a href="https://e-hentai.org/s/bd2b37d829/2122174-7"><img alt="007" title="Page 7: 2.png" src="https://ehgt.org/g/blank.gif" style="width:100px; height:139px; margin:-1px 0 0 -1px" /></a></div></div><div class="gdtm" style="height:170px"><div style="margin:1px auto 0; width:100px; height:100px; background:transparent url(https://ehgt.org/m/002122/2122174-00.jpg) -700px 0 no-repeat"><a href="https://e-hentai.org/s/4ca72f757d/2122174-8"><img alt="008" title="Page 8: 3.png" src="https://ehgt.org/g/blank.gif" style="width:100px; height:99px; margin:-1px 0 0 -1px" />"#;
 
-        let mut iter = r.captures_iter(h);
-        let first = iter.next().unwrap();
-        println!("{}", first.get(1).unwrap().as_str());
+        let links = collect_image_page_links(&[h.to_string()]);
 
-        let second = iter.next().unwrap();
-        println!("{}", second.get(1).unwrap().as_str());
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0], "https://e-hentai.org/s/bd2b37d829/2122174-7");
+        assert_eq!(links[1], "https://e-hentai.org/s/4ca72f757d/2122174-8");
     }
 }

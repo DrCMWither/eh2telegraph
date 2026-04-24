@@ -1,6 +1,7 @@
 use std::{convert::Infallible, ops::ControlFlow, sync::Arc};
 
 use dptree::{di::Injectable, from_fn_with_description, Handler, HandlerDescription};
+use teloxide::utils::markdown::escape;
 
 pub struct PrettyChat<'a>(pub &'a teloxide::types::Chat);
 
@@ -64,4 +65,8 @@ macro_rules! ok_or_break {
             }
         }
     };
+}
+
+pub fn esc<S: AsRef<str>>(s: S) -> String {
+    escape(s.as_ref())
 }
