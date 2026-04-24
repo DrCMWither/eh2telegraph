@@ -258,13 +258,21 @@ pub struct NHImageStream {
 
 impl NHImageStream {
     async fn load_image(client: GhostClient, link: &str) -> anyhow::Result<(ImageMeta, ImageData)> {
-        let data = client
-            .get(link)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+        let resp = timeout(
+            Duration::from_secs(20),
+            client.get(link).send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("image request timed out: {link}"))??;
+
+        let resp = resp.error_for_status()?;
+
+        let data = timeout(
+            Duration::from_secs(30),
+            resp.bytes(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("image body read timed out: {link}"))??;
 
         let meta = ImageMeta {
             id: link.to_string(),

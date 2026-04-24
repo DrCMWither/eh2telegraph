@@ -406,7 +406,7 @@ where
                                 let shown = xs
                                     .iter()
                                     .take(12)
-                                    .map(|t| format!("#{}", esc(t.replace(' ', "_"))))
+                                    .map(|t| format!("\\#{}", esc(t.replace(' ', "_"))))
                                     .collect::<Vec<_>>();
                                 format!("Tags: {}\n", shown.join(" "))
                             })

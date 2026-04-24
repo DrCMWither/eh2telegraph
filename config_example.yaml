@@ -29,3 +29,6 @@ worker_kv:
   cache_size: 10240
   expire_sec: 5184000 # 60 days
 
+storage:
+  mode: cloudflare # can be memory or auto
+

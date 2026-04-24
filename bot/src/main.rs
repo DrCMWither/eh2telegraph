@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(debug_assertions)]
     let cache = storage::SimpleMemStorage::default();
     #[cfg(not(debug_assertions))]
-    let cache = storage::cloudflare_kv::CFOrMemStorage::new_from_config();
+    let cache = storage::cloudflare_kv::CFOrMemStorage::new_from_config()?;
 
     let mut synchronizer = Synchronizer::new(
         telegraph,
