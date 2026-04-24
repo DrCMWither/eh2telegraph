@@ -1,4 +1,4 @@
-#![feature(type_alias_impl_trait)]
+
 #![feature(impl_trait_in_assoc_type)]
 
 #[macro_use]
@@ -16,3 +16,4 @@ pub mod stream;
 pub mod sync;
 pub mod tls;
 pub mod util;
+pub mod types;

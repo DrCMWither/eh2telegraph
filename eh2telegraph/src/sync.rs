@@ -12,6 +12,7 @@ use crate::{
         RandomAccessToken, Telegraph, TelegraphError, MAX_SINGLE_FILE_SIZE,
     },
     util::match_first_group,
+    util::public_image_url,
 };
 
 const ERR_THRESHOLD: usize = 10;
@@ -27,7 +28,16 @@ pub enum UploadError<SE> {
     Reqwest(#[from] TelegraphError),
 }
 
+#[derive(Debug, Clone)]
+pub struct SyncResult {
+    pub page_url: String,
+    pub title: Option<String>,
+    pub authors: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+}
+
 pub struct Synchronizer<C = CFStorage> {
+    pub image_proxy_base: String,
     tg: Telegraph<RandomAccessToken, ProxiedClient>,
     limit: Option<usize>,
 
@@ -50,6 +60,7 @@ where
         tg: Telegraph<RandomAccessToken, ProxiedClient>,
         registry: Registry,
         cache: CACHE,
+        image_proxy_base: String,
     ) -> Self {
         Self {
             tg,
@@ -59,6 +70,7 @@ where
             cache_ttl: None,
             registry,
             cache,
+            image_proxy_base,
         }
     }
 
@@ -82,7 +94,7 @@ where
         self.cache.delete(key).await
     }
 
-    pub async fn sync<C: Collector>(&self, path: String) -> anyhow::Result<String>
+    pub async fn sync<C: Collector>(&self, path: String) -> anyhow::Result<SyncResult>
     where
         Registry: Param<C>,
         C::FetchError: Into<anyhow::Error> + Send + 'static,
@@ -91,22 +103,32 @@ where
         C::ImageStream: Send + 'static,
         <C::ImageStream as AsyncStream>::Future: Send + 'static,
     {
-        // check cache
         let cache_key = format!("{}|{}", C::name(), path);
+
         if let Ok(Some(v)) = self.cache.get(&cache_key).await {
             tracing::info!("[cache] hit key {cache_key}");
-            return Ok(v);
+            return Ok(SyncResult {
+                page_url: v,
+                title: None,
+                authors: None,
+                tags: None,
+            });
         }
+
         tracing::info!("[cache] miss key {cache_key}");
 
         let collector: &C = self.registry.get();
         let (meta, stream) = collector.fetch(path).await.map_err(Into::into)?;
+
+        let title = meta.name.clone();
+        let authors = meta.authors.clone();
+        let tags = meta.tags.clone();
+
         let page = self
             .sync_stream(meta, stream)
             .await
             .map_err(anyhow::Error::from)?;
 
-        // set cache
         let _ = self
             .cache
             .set(
@@ -115,7 +137,13 @@ where
                 Some(self.cache_ttl.unwrap_or(Self::DEFAULT_CACHE_TTL)),
             )
             .await;
-        Ok(page.url)
+
+        Ok(SyncResult {
+            page_url: page.url,
+            title: Some(title),
+            authors,
+            tags,
+        })
     }
 
     pub async fn sync_stream<S, SE>(
@@ -157,11 +185,6 @@ where
         // in this big loop, we will download images, and upload them in batch.
         // then, all meta info will be saved in `uploaded`.
         loop {
-            // TODO: load images one by one is too slow!
-            // We can spawn a background task(FuturesUnordered) and use channel, but expose as AsyncStream,
-            // which does not require changes on consuming side.
-
-            // 1. download images in batch
             while let Some(fut) = stream.next() {
                 let data = match fut.await {
                     Err(e) => {
@@ -176,43 +199,49 @@ where
                         d
                     }
                 };
-
-                // if the data size is too big to upload, we will discard it.
+        
                 if data.1.len() >= MAX_SINGLE_FILE_SIZE {
                     tracing::error!("Too big file, discarded. Meta: {:?}", data.0);
                     continue;
                 }
-
+        
                 buffer.push(data);
                 if buffer.len() > BATCH_LEN_THRESHOLD || buffer.size() > BATCH_SIZE_THRESHOLD {
                     break;
                 }
             }
-            // all data is uploaded, and no data to process.
-            // just break the big loop.
+        
             if buffer.is_empty() {
                 break;
             }
-
-            // 2. upload the batch
+        
             let (full_data, size) = buffer.swap();
             let image_count = full_data.len();
-            tracing::debug!("download {image_count} images with size {size}, will upload them",);
-
-            let (meta, data) = full_data
+            tracing::debug!("download {image_count} images with size {size}, will upload them");
+        
+            let (meta, _data) = full_data
                 .into_iter()
                 .map(|(a, b)| (a, b.as_ref().to_owned()))
                 .unzip::<_, _, Vec<_>, Vec<_>>();
-            let medium = self.tg.upload(data).await?;
+        
+            let proxied_urls = meta
+                .iter()
+                .map(|m| public_image_url(&self.image_proxy_base, &m.url))
+                .collect::<Vec<_>>();
+        
             err_count = 0;
-
-            // 3. add to uploaded
-            tracing::debug!("upload {image_count} images with size {size}, medium: {medium:?}");
-            uploaded.extend(
-                meta.into_iter()
-                    .zip(medium.into_iter().map(|x| x.src))
-                    .map(|(meta, src)| UploadedImage { meta, src }),
-            );
+        
+            tracing::info!("proxy image count: {}", proxied_urls.len());
+        
+            for (meta, src) in meta.into_iter().zip(proxied_urls.into_iter()) {
+                tracing::info!("proxy image src = {}", src);
+                uploaded.push(UploadedImage { meta, src });
+            }
+        }
+        
+        tracing::info!("uploaded total count after loop = {}", uploaded.len());
+        for img in &uploaded {
+            tracing::info!("uploaded total src = {}", img.src);
         }
 
         // create telegraph page, or multi pages
@@ -271,7 +300,7 @@ fn write_footer(content: &mut Vec<Node>, original_link: &str, next_page: Option<
     }
     content.push(np!(
         nt!("Generated by "),
-        na!(@"https://github.com/qini7-sese/eh2telegraph", nt!("eh2telegraph"))
+        na!(@"https://github.com/FDrCMWither/eh2telegraph", nt!("eh2telegraph"))
     ));
     content.push(np!(
         nt!("Original link: "),
@@ -305,6 +334,10 @@ struct UploadedImage {
 // Size: {"tag":"img","attrs":{"src":"https://telegra.ph..."}}
 impl From<UploadedImage> for Node {
     fn from(i: UploadedImage) -> Self {
-        Node::new_image(format!("https://telegra.ph{}", i.src))
+        if i.src.starts_with("http://") || i.src.starts_with("https://") {
+            Node::new_image(i.src)
+        } else {
+            Node::new_image(format!("https://telegra.ph{}", i.src))
+        }
     }
 }

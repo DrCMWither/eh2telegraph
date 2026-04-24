@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 dptree = "0.3"
 once_cell = "1"
 regex = "1"
+urlencoding = "2"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "multipart",
@@ -33,6 +34,7 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "parking_lot",
 ] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [
     "local-time",
@@ -41,8 +43,9 @@ tracing-subscriber = { version = "0.3", features = [
     "env-filter",
 ] }
 
+
 [build-dependencies]
-vergen = { version = "8", default_features = false, features = [
+vergen = { version = "8", default-features = false, features = [
     "build",
     "cargo",
     "rustc",

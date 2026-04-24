@@ -2,6 +2,10 @@
 
 [中文](README-zh.md)|英文
 
+This project is a heavily optimized and refactored fork of [qini7-sese/eh2telegraph:master](https://github.com/qini7-sese/eh2telegraph).
+
+The original contributors of the upstream project are not associated with this fork, and hold no responsibility for the code quality, stability, security, or ongoing maintenance of this repository. For any issues, bug reports, or feature requests, please open an issue in this repository directly and refrain from contacting the original authors.
+
 Bot that automatically downloads image sets from EH/EX/NH and uploads them to Telegraph.
 
 This code is only guaranteed to work correctly on MacOS (partial functionality) and Linux.

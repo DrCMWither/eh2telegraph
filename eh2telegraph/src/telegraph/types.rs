@@ -237,12 +237,18 @@ impl Node {
 
     pub fn new_image<S: Into<String>>(src: S) -> Self {
         Node::NodeElement(NodeElement {
-            tag: Tag::Img,
-            attrs: Some(NodeElementAttr {
-                src: Some(src.into()),
-                href: None,
-            }),
-            children: None,
+            tag: Tag::Figure,
+            attrs: None,
+            children: Some(vec![
+                Node::NodeElement(NodeElement {
+                    tag: Tag::Img,
+                    attrs: Some(NodeElementAttr {
+                        src: Some(src.into()),
+                        href: None,
+                    }),
+                    children: None,
+                })
+            ]),
         })
     }
 }

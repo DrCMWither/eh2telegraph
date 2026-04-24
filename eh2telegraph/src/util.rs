@@ -34,3 +34,9 @@ pub async fn get_string<C: HttpRequestBuilder>(client: &C, link: &str) -> reqwes
         .text()
         .await
 }
+
+#[inline]
+pub fn public_image_url(base: &str, original: &str) -> String {
+    let encoded = urlencoding::encode(original);
+    format!("{}/img?u={}", base.trim_end_matches('/'), encoded)
+}

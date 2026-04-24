@@ -1,4 +1,5 @@
 use std::{borrow::Cow, collections::HashSet};
+use std::{ops::ControlFlow, sync::Arc};
 
 use eh2telegraph::{
     collector::{e_hentai::EHCollector, exhentai::EXCollector, nhentai::NHCollector},
@@ -8,16 +9,15 @@ use eh2telegraph::{
         ImageSearcher,
     },
     storage::KVStorage,
-    sync::Synchronizer,
+    sync::{Synchronizer, SyncResult},
 };
-
 use reqwest::Url;
 use teloxide::{
     adaptors::DefaultParseMode,
     prelude::*,
     utils::{
         command::BotCommands,
-        markdown::{code_inline, escape, link},
+        markdown::{code_inline, escape},
     },
 };
 use tracing::{info, trace};
@@ -35,10 +35,8 @@ const MIN_SIMILARITY_PRIVATE: u8 = 50;
     这是一个方便用户直接在 Telegram 里看图的画廊同步机器人。\n\
     Bot supports sync with command, text url, or image(private chat search thrashold is lower).\n\
     机器人支持通过 命令、直接发送链接、图片(私聊搜索相似度阈值会更低) 的形式同步。\n\n\
-    Bot develop group / Bot 开发群 https://t.me/TGSyncBotWorkGroup\n\
-    And welcome to join image channel / 频道推荐 https://t.me/sesecollection\n\n\
     These commands are supported:\n\
-    目前支持这些指令:"
+    支持指令:"
 )]
 pub enum Command {
     #[command(description = "Display this help. 显示这条帮助信息。")]
@@ -86,7 +84,7 @@ where
 
     /// Executed when a command comes in and parsed successfully.
     pub async fn respond_cmd(
-        &'static self,
+        self: Arc<Self>,
         bot: DefaultParseMode<Bot>,
         msg: Message,
         command: Command,
@@ -146,7 +144,7 @@ where
     }
 
     pub async fn respond_admin_cmd(
-        &'static self,
+        self: Arc<Self>,
         bot: DefaultParseMode<Bot>,
         msg: Message,
         command: AdminCommand,
@@ -166,7 +164,7 @@ where
     }
 
     pub async fn respond_text(
-        &'static self,
+        self: Arc<Self>,
         bot: DefaultParseMode<Bot>,
         msg: Message,
     ) -> ControlFlow<()> {
@@ -204,9 +202,17 @@ where
                     .await
             );
             tokio::spawn(async move {
-                let _ = bot
-                    .edit_message_text(msg.chat.id, msg.id, self.sync_response(&url).await)
-                    .await;
+                let text = self.sync_response(&url).await;
+                match bot
+                    .inner()
+                    .edit_message_text(msg.chat.id, msg.id, text)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("failed to edit sync message: {}", e);
+                    }
+                }
             });
             return ControlFlow::Break(());
         }
@@ -216,7 +222,7 @@ where
     }
 
     pub async fn respond_caption(
-        &'static self,
+        self: Arc<Self>,
         bot: DefaultParseMode<Bot>,
         msg: Message,
     ) -> ControlFlow<()> {
@@ -274,7 +280,7 @@ where
     }
 
     pub async fn respond_photo(
-        &'static self,
+        self: Arc<Self>,
         bot: DefaultParseMode<Bot>,
         msg: Message,
     ) -> ControlFlow<()> {
@@ -346,7 +352,7 @@ where
     }
 
     pub async fn respond_default(
-        &'static self,
+        self: Arc<Self>,
         bot: DefaultParseMode<Bot>,
         msg: Message,
     ) -> ControlFlow<()> {
@@ -363,21 +369,41 @@ where
     }
 
     async fn sync_response(&self, url: &str) -> String {
-        self.single_flight
-            .work(url, || async {
-                match self.route_sync(url).await {
-                    Ok(url) => {
-                        format!("Sync to telegraph finished: {}", link(&url, &escape(&url)))
-                    }
-                    Err(e) => {
-                        format!("Sync to telegraph failed: {}", escape(&e.to_string()))
-                    }
+    self.single_flight
+        .work(url, || async {
+            match self.route_sync(url).await {
+                Ok(result) => {
+                    let title_line = result.title.map(|t| format!("Title: {}\n", t)).unwrap_or_default();
+                    let authors_line = result.authors
+                        .filter(|xs| !xs.is_empty())
+                        .map(|xs| format!("Authors: {}\n", xs.join(", ")))
+                        .unwrap_or_default();
+                    let tags_line = result.tags
+                        .filter(|xs| !xs.is_empty())
+                        .map(|xs| {
+                            let shown = xs.iter().take(12)
+                                .map(|t| format!("#{}", t.replace(' ', "_")))
+                                .collect::<Vec<_>>();
+                            format!("Tags: {}\n", shown.join(" "))
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "Sync to telegraph finished\n{}{}{}URL: {}",
+                        title_line,
+                        authors_line,
+                        tags_line,
+                        result.page_url
+                    )
                 }
-            })
-            .await
-    }
+                Err(e) => {
+                    format!("Sync to telegraph failed: {}", escape(&e.to_string()))
+                }
+            }
+        })
+        .await
+}
 
-    async fn route_sync(&self, url: &str) -> anyhow::Result<String> {
+    async fn route_sync(&self, url: &str) -> anyhow::Result<SyncResult> {
         let u = Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid url"))?;
         let host = u.host_str().unwrap_or_default();
         let path = u.path().to_string();

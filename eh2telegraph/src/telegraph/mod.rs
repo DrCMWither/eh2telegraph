@@ -13,6 +13,7 @@ use reqwest::{
     Client, Response,
 };
 use serde::Serialize;
+use serde_json;
 
 use crate::http_client::HttpRequestBuilder;
 
@@ -160,10 +161,33 @@ where
                 author_url: &page.author_url,
             },
         };
-        execute!(self
+        let resp = self
             .client
             .post_builder("https://api.telegra.ph/createPage")
-            .form(&to_post))
+            .form(&to_post)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        tracing::warn!(
+            "telegraph createPage raw response: status={}, body={}",
+            status,
+            text
+        );
+
+        let parsed: ApiResult<Page> =
+            serde_json::from_str(&text).map_err(|e| {
+                tracing::error!(
+                    "telegraph createPage decode failed: {}; raw body = {}",
+                    e,
+                    text
+                );
+                TelegraphError::Server
+            })?;
+
+        parsed.into()
     }
 
     /// Edit page.

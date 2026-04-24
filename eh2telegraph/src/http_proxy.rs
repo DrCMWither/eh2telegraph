@@ -75,7 +75,7 @@ macro_rules! impl_method {
                 Some(p) => self
                     .inner
                     .$method(p.endpoint.clone())
-                    .header("X-Forwarded-For", url)
+                    .header("X-Target-URL", url)
                     .header("X-Authorization", p.authorization.clone()),
                 None => self.inner.$method(url),
             }
@@ -96,7 +96,7 @@ impl ProxiedClient {
             Some(p) => self
                 .inner
                 .request(method, p.endpoint.clone())
-                .header("X-Forwarded-For", url)
+                .header("X-Target-URL", url)
                 .header("X-Authorization", p.authorization.clone()),
             None => self.inner.request(method, url),
         }

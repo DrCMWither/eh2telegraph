@@ -5,16 +5,15 @@
 /// use nhapi.cat42.uk(there will be some syncing latency).
 use again::RetryPolicy;
 use rand::seq::SliceRandom;
-use reqwest::Response;
 use serde::Deserialize;
 use std::time::Duration;
+use tokio::time::{timeout};
 
 use crate::{
     http_client::{GhostClient, GhostClientBuilder},
     stream::AsyncStream,
-    util::get_bytes,
+    types::NhTag,
 };
-
 use super::{AlbumMeta, Collector, ImageData, ImageMeta};
 
 const NHAPI: &str = "https://nhapi.cat42.uk/gallery/";
@@ -26,12 +25,10 @@ lazy_static::lazy_static! {
 }
 
 const DOMAIN_LIST: [&str; 0] = [];
-const NH_CDN_LIST: [&str; 5] = [
+const NH_CDN_LIST: [&str; 3] = [
     "https://i.nhentai.net/galleries",
     "https://i2.nhentai.net/galleries",
     "https://i3.nhentai.net/galleries",
-    "https://i5.nhentai.net/galleries",
-    "https://i7.nhentai.net/galleries",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -59,7 +56,7 @@ struct NhAlbum {
     media_id: String,
     title: Title,
     images: Images,
-    // tags: Vec<Tag>,
+    tags: Vec<NhTag>,
     // num_pages: usize,
 }
 
@@ -103,6 +100,8 @@ enum ImageType {
     Png,
     #[serde(rename = "g")]
     Gif,
+    #[serde(rename = "w")]
+    Webp,
 }
 
 impl ImageType {
@@ -111,6 +110,7 @@ impl ImageType {
             ImageType::Jpg => ".jpg",
             ImageType::Png => ".png",
             ImageType::Gif => ".gif",
+            ImageType::Webp => ".webp",
         }
     }
 }
@@ -153,13 +153,34 @@ impl Collector for NHCollector {
 
         // clone client to force changing ip
         let client = self.client.clone();
-        let album: NhAlbum = client
-            .get(&api_url)
-            .send()
+
+        tracing::info!("[nhentai] sending metadata request: {}", api_url);
+
+        let resp = timeout(
+            Duration::from_secs(20),
+            client.get(&api_url).send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("nhentai metadata request timed out"))??;
+
+        tracing::info!(
+            "[nhentai] metadata response received: status={}",
+            resp.status()
+        );
+
+        let resp = resp.error_for_status()?;
+
+        let body = timeout(Duration::from_secs(20), resp.text())
             .await
-            .and_then(Response::error_for_status)?
-            .json()
-            .await?;
+            .map_err(|_| anyhow::anyhow!("nhentai metadata body read timed out"))??;
+
+        tracing::info!(
+            "[nhentai] metadata body length={}, preview={}",
+            body.len(),
+            body.chars().take(200).collect::<String>()
+        );
+
+        let album: NhAlbum = serde_json::from_str(&body)?;
         let title = album.title.title(|| format!("nhentai-{album_id}"));
         let image_urls = album
             .images
@@ -176,8 +197,19 @@ impl Collector for NHCollector {
                 name: title,
                 class: None,
                 description: None,
-                authors: None,
-                tags: None,
+                authors: Some(
+                    album.tags
+                        .iter()
+                        .filter(|t| t.tag_type == "artist" || t.tag_type == "group")
+                        .map(|t| t.name.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                tags: Some(
+                    album.tags
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect::<Vec<_>>()
+                ),
             },
             NHImageStream { client, image_urls },
         ))
@@ -226,37 +258,53 @@ pub struct NHImageStream {
 
 impl NHImageStream {
     async fn load_image(client: GhostClient, link: &str) -> anyhow::Result<(ImageMeta, ImageData)> {
-        let image_data = RETRY_POLICY
-            .retry(|| async { get_bytes(&client, link).await })
+        let data = client
+            .get(link)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
             .await?;
 
-        tracing::trace!(
-            "download nhentai image with size {}, link: {link}",
-            image_data.len()
-        );
         let meta = ImageMeta {
             id: link.to_string(),
             url: link.to_string(),
             description: None,
         };
-        Ok((meta, image_data))
+
+        Ok((meta, data))
+    }
+
+    async fn load_image_meta_only(link: &str) -> anyhow::Result<(ImageMeta, ImageData)> {
+        let meta = ImageMeta {
+            id: link.to_string(),
+            url: link.to_string(),
+            description: None,
+        };
+        Ok((meta, bytes::Bytes::new()))
     }
 }
 
 impl AsyncStream for NHImageStream {
     type Item = anyhow::Result<(ImageMeta, ImageData)>;
-
     type Future = impl std::future::Future<Output = Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         let link = self.image_urls.next()?;
         let client = self.client.clone();
+
         Some(async move {
-            match Self::load_image(client.clone(), link.raw()).await {
+            match NHImageStream::load_image(client.clone(), link.raw()).await {
                 Ok(r) => Ok(r),
                 Err(e) => {
                     tracing::error!("fallback for nh image {link:?}: {e}");
-                    Self::load_image(client, &link.fallback()).await
+                    match NHImageStream::load_image(client, &link.fallback()).await {
+                        Ok(r) => Ok(r),
+                        Err(e2) => {
+                            tracing::error!("nh image failed finally {link:?}: {e2}");
+                            NHImageStream::load_image_meta_only(link.raw()).await
+                        }
+                    }
                 }
             }
         })
