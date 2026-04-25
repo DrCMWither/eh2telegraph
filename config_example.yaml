@@ -25,10 +25,8 @@ exhentai:
 
 worker_kv:
   endpoint: https://kv.xxx.workers.dev
+  mode: cloudflare # can be memory or auto
   token: xxx
   cache_size: 10240
   expire_sec: 5184000 # 60 days
-
-storage:
-  mode: cloudflare # can be memory or auto
 

@@ -1,9 +1,6 @@
 use std::collections::VecDeque;
-use std::fmt;
 use std::future::Future;
-
-use futures::FutureExt;
-use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 /// We define a AsyncStream to replace futures::Stream since we don't want to implement
 /// poll_next nor using async_stream.
@@ -37,7 +34,7 @@ where
     St: AsyncStream,
 {
     stream: Option<St>,
-    queue: VecDeque<oneshot::Receiver<St::Item>>,
+    queue: VecDeque<JoinHandle<St::Item>>,
     max: usize,
 }
 
@@ -46,25 +43,13 @@ where
     St: AsyncStream,
 {
     pub fn new(stream: St, buffer_size: usize) -> Self {
+        assert!(buffer_size > 0, "buffer_size must be greater than 0");
+
         Self {
             stream: Some(stream),
             queue: VecDeque::with_capacity(buffer_size),
             max: buffer_size,
         }
-    }
-}
-
-impl<St> fmt::Debug for Buffered<St>
-where
-    St: AsyncStream + fmt::Debug,
-    St::Item: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Buffered")
-            .field("stream", &self.stream)
-            .field("queue", &self.queue)
-            .field("max", &self.max)
-            .finish()
     }
 }
 
@@ -75,34 +60,29 @@ where
     St::Future: Send + 'static,
 {
     type Item = St::Item;
-
-    type Future = impl std::future::Future<Output = Self::Item>;
+    type Future = impl Future<Output = Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         while self.queue.len() < self.max {
-            let item = match self.stream.as_mut() {
-                Some(st) => match st.next() {
-                    Some(item) => Some(item),
-                    None => {
-                        self.stream = None;
-                        None
-                    }
-                },
-                None => None,
+            let Some(st) = self.stream.as_mut() else {
+                break;
             };
-            match item {
-                Some(f) => {
-                    let (tx, rx) = oneshot::channel::<Self::Item>();
-                    tokio::spawn(async move {
-                        let _ = tx.send(f.await);
-                    });
-                    self.queue.push_back(rx);
-                }
-                None => break,
-            }
+
+            let Some(fut) = st.next() else {
+                self.stream = None;
+                break;
+            };
+
+            self.queue.push_back(tokio::spawn(fut));
         }
-        self.queue
-            .pop_front()
-            .map(|x| x.map(|xx| xx.expect("oneshot tx dropped which is unexpected")))
+
+        self.queue.pop_front().map(|handle| async move {
+            match handle.await {
+                Ok(item) => item,
+                Err(e) => {
+                    panic!("buffered task failed: {e}");
+                }
+            }
+        })
     }
 }

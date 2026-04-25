@@ -23,7 +23,7 @@ use teloxide::{
 
 use tracing::{info, trace};
 use tokio::time::{timeout, Duration};
-use crate::{ok_or_break, util::PrettyChat, util::esc};
+use crate::{util::PrettyChat, util::esc};
 
 const MIN_SIMILARITY: u8 = 70;
 const MIN_SIMILARITY_PRIVATE: u8 = 50;
@@ -275,8 +275,17 @@ where
                         .skip(entry.offset)
                         .take(entry.length)
                         .collect();
-                    let content = ok_or_break!(String::from_utf16(&encoded));
-                    Cow::from(content)
+                        let content = match String::from_utf16(&encoded) {
+                            Ok(content) => content,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[caption handler] failed to decode URL entity from UTF-16: {}",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        Cow::from(content)
                 }
                 teloxide::types::MessageEntityKind::TextLink { url } => Cow::from(url.as_ref()),
                 _ => {
@@ -312,10 +321,57 @@ where
             }
         };
 
-        let f = ok_or_break!(bot.get_file(&first_photo.file.id).await);
+        let f = match bot.get_file(&first_photo.file.id).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(
+                    "[photo handler] failed to get Telegram file {}: {}",
+                    first_photo.file.id,
+                    e
+                );
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        esc("Failed to get the image file from Telegram."),
+                    )
+                    .reply_to_message_id(msg.id)
+                    .await;
+                return ControlFlow::Break(());
+            }
+        };
+
         let mut buf: Vec<u8> = Vec::with_capacity(f.size as usize);
-        ok_or_break!(teloxide::net::Download::download_file(&bot, &f.path, &mut buf).await);
-        let search_result: SaucenaoOutput = ok_or_break!(self.searcher.search(buf).await);
+        if let Err(e) = teloxide::net::Download::download_file(&bot, &f.path, &mut buf).await {
+            tracing::error!(
+                "[photo handler] failed to download Telegram file {}: {}",
+                f.path,
+                e
+            );
+
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    esc("Failed to download the image file from Telegram."),
+                )
+                .reply_to_message_id(msg.id)
+                .await;
+            return ControlFlow::Break(());
+        }
+
+        let search_result: SaucenaoOutput = match self.searcher.search(buf).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("[photo handler] SauceNAO search failed: {}", e);
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        esc("Image search failed. Please try again later."),
+                    )
+                    .reply_to_message_id(msg.id)
+                    .await;
+                return ControlFlow::Break(());
+            }
+        };
 
         let mut url_sim = None;
         let threshold = if msg.chat.is_private() {
@@ -330,11 +386,19 @@ where
         {
             match element.parsed {
                 SaucenaoParsed::EHentai(f_hash) => {
-                    url_sim = Some((
-                        ok_or_break!(self.convertor.convert_to_gallery(&f_hash).await),
-                        element.similarity,
-                    ));
-                    break;
+                    match self.convertor.convert_to_gallery(&f_hash).await {
+                        Ok(url) => {
+                            url_sim = Some((url, element.similarity));
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[photo handler] failed to convert EHentai file hash to gallery URL: {}",
+                                e
+                            );
+                            continue;
+                        }
+                    }
                 }
                 SaucenaoParsed::NHentai(nid) => {
                     url_sim = Some((format!("https://nhentai.net/g/{nid}/"), element.similarity));
@@ -365,11 +429,16 @@ where
         msg: Message,
     ) -> ControlFlow<()> {
         if msg.chat.is_private() {
-            ok_or_break!(
-                bot.send_message(msg.chat.id, esc("Unrecognized message."))
-                    .reply_to_message_id(msg.id)
-                    .await
-            );
+            if let Err(e) = bot
+                .send_message(msg.chat.id, esc("Unrecognized message."))
+                .reply_to_message_id(msg.id)
+                .await
+            {
+                tracing::error!(
+                    "[default handler] failed to send unrecognized-message reply: {}",
+                    e
+                );
+            }
         }
         #[cfg(debug_assertions)]
         tracing::warn!("{:?}", msg);

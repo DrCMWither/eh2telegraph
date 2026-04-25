@@ -55,40 +55,6 @@ where
     })
 }
 
-// TODO: remove this macro after all handler paths are migrated.
-// Do not use in new code. It hides early return from call sites.
-#[deprecated(note = "Will soon be deprecated, please use explicit match")]
-#[macro_export]
-macro_rules! ok_or_break {
-    ($e:expr) => {{
-        match $e {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(
-                    error = ?e,
-                    expr = stringify!($e),
-                    "operation failed; breaking handler"
-                );
-                return std::ops::ControlFlow::Break(());
-            }
-        }
-    }};
-
-    ($ctx:expr, $e:expr) => {{
-        match $e {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(
-                    error = ?e,
-                    expr = stringify!($e),
-                    context = %$ctx,
-                    "operation failed; breaking handler"
-                );
-                return std::ops::ControlFlow::Break(());
-            }
-        }
-    }};
-}
 
 pub fn esc<S: AsRef<str>>(s: S) -> String {
     escape(s.as_ref())
