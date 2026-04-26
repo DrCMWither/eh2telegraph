@@ -29,6 +29,7 @@ const IMAGE_ALLOWED_HOSTS = new Set([
     "i.nhentai.net",
     "i2.nhentai.net",
     "i3.nhentai.net",
+    "t.nhentai.net",
 
     "ehgt.org",
     "e-hentai.org",
@@ -56,10 +57,31 @@ function validateHttpsUrl(url) {
     if (url.protocol !== "https:") {
         return "only https is allowed";
     }
+
     if (url.username || url.password) {
         return "url credentials are not allowed";
     }
+
     return null;
+}
+
+function isAllowedPrivateHost(hostname) {
+    const host = hostname.toLowerCase();
+    return PRIVATE_ALLOWED_HOSTS.has(host);
+}
+
+function isAllowedImageHost(hostname) {
+    const host = hostname.toLowerCase();
+
+    if (IMAGE_ALLOWED_HOSTS.has(host)) {
+        return true;
+    }
+
+    if (host.endsWith(".hath.network")) {
+        return true;
+    }
+
+    return false;
 }
 
 function buildPrivateHeaders(request) {
@@ -67,7 +89,9 @@ function buildPrivateHeaders(request) {
 
     for (const name of ["Content-Type", "Accept", "User-Agent"]) {
         const value = request.headers.get(name);
-        if (value) out.set(name, value);
+        if (value) {
+            out.set(name, value);
+        }
     }
 
     return out;
@@ -81,8 +105,17 @@ function buildImageHeaders(targetUrl) {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     );
 
-    if (targetUrl.hostname.endsWith("nhentai.net")) {
+    const host = targetUrl.hostname.toLowerCase();
+
+    if (host.endsWith("nhentai.net")) {
         headers.set("Referer", "https://nhentai.net/");
+    } else if (
+        host === "ehgt.org" ||
+        host === "e-hentai.org" ||
+        host === "exhentai.org" ||
+        host.endsWith(".hath.network")
+    ) {
+        headers.set("Referer", "https://exhentai.org/");
     }
 
     return headers;
@@ -92,10 +125,14 @@ function buildSafeResponseHeaders(upstream, extra = {}) {
     const headers = new Headers();
 
     const contentType = upstream.headers.get("Content-Type");
-    if (contentType) headers.set("Content-Type", contentType);
+    if (contentType) {
+        headers.set("Content-Type", contentType);
+    }
 
     const contentLength = upstream.headers.get("Content-Length");
-    if (contentLength) headers.set("Content-Length", contentLength);
+    if (contentLength) {
+        headers.set("Content-Length", contentLength);
+    }
 
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("X-Content-Type-Options", "nosniff");
@@ -133,8 +170,8 @@ async function handlePrivateProxy(request, env) {
         return text(403, invalidReason);
     }
 
-    if (!PRIVATE_ALLOWED_HOSTS.has(targetUrl.hostname)) {
-        return text(403, "target host is not allowed");
+    if (!isAllowedPrivateHost(targetUrl.hostname)) {
+        return text(403, `target host is not allowed: ${targetUrl.hostname}`);
     }
 
     const init = {
@@ -179,8 +216,8 @@ async function handlePublicImageProxy(request) {
         return text(403, invalidReason);
     }
 
-    if (!IMAGE_ALLOWED_HOSTS.has(targetUrl.hostname)) {
-        return text(403, "forbidden host");
+    if (!isAllowedImageHost(targetUrl.hostname)) {
+        return text(403, `forbidden host: ${targetUrl.hostname}`);
     }
 
     const upstream = await fetch(targetUrl.toString(), {
@@ -189,6 +226,7 @@ async function handlePublicImageProxy(request) {
         cf: {
             cacheTtl: 86400,
             cacheEverything: true,
+            cacheKey: targetUrl.toString(),
         },
     });
 
@@ -235,6 +273,10 @@ async function handleRequest(request, env) {
 
 export default {
     async fetch(request, env) {
-        return handleRequest(request, env);
+        try {
+            return await handleRequest(request, env);
+        } catch (e) {
+            return text(500, `worker error: ${e && e.message ? e.message : String(e)}`);
+        }
     },
 };

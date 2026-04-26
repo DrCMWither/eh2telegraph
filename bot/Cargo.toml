@@ -20,10 +20,11 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 singleflight-async = { version = "0.1", features = ["hardware-lock-elision"] }
-teloxide = { version = "0.12", features = [
+teloxide = { version = "0.12", default-features = false, features = [
     "macros",
     "ctrlc_handler",
     "auto-send",
+    "rustls"
 ] }
 time = { version = "0.3.34", features = ["local-offset", "std", "macros"] }
 tokio = { version = "1", default-features = false, features = [

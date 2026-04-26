@@ -275,12 +275,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let telegram_client = client_from_env();
     // ---- supervisor loop ----
     loop {
         tracing::info!("starting telegram bot...");
 
-        let bot = Bot::with_client(base_config.bot_token.clone(), client_from_env())
-            .parse_mode(ParseMode::MarkdownV2);
+        let bot = Bot::with_client(base_config.bot_token.clone(), telegram_client.clone())
+        .parse_mode(ParseMode::MarkdownV2);
 
         let admin_filter_handler = handler.clone();
 
