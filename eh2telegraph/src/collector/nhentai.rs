@@ -295,13 +295,13 @@ impl NHImageStream {
 
 impl AsyncStream for NHImageStream {
     type Item = anyhow::Result<(ImageMeta, ImageData)>;
-    type Future = impl std::future::Future<Output = Self::Item>;
+    type Future = crate::stream::BoxFuture<Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         let link = self.image_urls.next()?;
         let client = self.client.clone();
 
-        Some(async move {
+        Some(Box::pin(async move {
             match NHImageStream::load_image(client.clone(), link.raw()).await {
                 Ok(r) => Ok(r),
                 Err(e) => {
@@ -315,7 +315,7 @@ impl AsyncStream for NHImageStream {
                     }
                 }
             }
-        })
+        }))
     }
 
     #[inline]

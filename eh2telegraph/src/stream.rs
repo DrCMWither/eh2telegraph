@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use tokio::task::JoinHandle;
+use std::pin::Pin;
 
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// We define a AsyncStream to replace futures::Stream since we don't want to implement
 /// poll_next nor using async_stream.
 /// Although we use GAT, we don't want the future to capture self's ref. We did like
@@ -60,7 +62,7 @@ where
     St::Future: Send + 'static,
 {
     type Item = St::Item;
-    type Future = impl Future<Output = Self::Item>;
+    type Future = BoxFuture<Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         while self.queue.len() < self.max {
@@ -76,13 +78,15 @@ where
             self.queue.push_back(tokio::spawn(fut));
         }
 
-        self.queue.pop_front().map(|handle| async move {
-            match handle.await {
-                Ok(item) => item,
-                Err(e) => {
-                    panic!("buffered task failed: {e}");
+        self.queue.pop_front().map(|handle| {
+            Box::pin(async move {
+                match handle.await {
+                    Ok(item) => item,
+                    Err(e) => {
+                        panic!("buffered task failed: {e}");
+                    }
                 }
-            }
+            }) as BoxFuture<Self::Item>
         })
     }
 }

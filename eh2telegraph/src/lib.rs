@@ -1,6 +1,3 @@
-
-#![feature(impl_trait_in_assoc_type)]
-
 #[macro_use]
 pub mod telegraph;
 

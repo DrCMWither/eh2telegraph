@@ -54,7 +54,7 @@ pub const UAS: [&str; 45] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.132 Whale/2.7.99.13 Safari/537.36",
 ];
 const CONFIG_KEY: &str = "http";
-const TIMTOUT: Duration = Duration::from_secs(30);
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
@@ -172,7 +172,7 @@ impl GhostClientBuilder {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GhostClient {
     prefix: Option<Ipv6Net>,
     mapping: Arc<Vec<(&'static str, SocketAddr)>>,
@@ -187,8 +187,9 @@ impl GhostClient {
     }
 }
 
-impl Clone for GhostClient {
-    fn clone(&self) -> Self {
+impl GhostClient {
+    // method fresh() can be used only when you really need to rebuild pool or force changing ip
+    pub fn fresh(&self) -> Self {
         let inner = Self::build_raw(&self.prefix, &self.mapping, self.headers.clone());
         Self {
             prefix: self.prefix,
@@ -219,7 +220,7 @@ impl GhostClient {
         mapping: &[(&'static str, SocketAddr)],
         headers: Option<header::HeaderMap>,
     ) -> reqwest::Client {
-        let mut builder = reqwest::Client::builder().timeout(TIMTOUT);
+        let mut builder = reqwest::Client::builder().timeout(TIMEOUT);
 
         if let Some(headers) = headers {
             builder = builder.default_headers(headers);
@@ -249,7 +250,8 @@ impl GhostClient {
 
         builder.build().expect("build reqwest client failed")
     }
-
+    // Rebuild the underlying reqwest client in place.
+    // Expensive; use only to rotate local IPv6 address or reset the pool.
     pub fn refresh(&mut self) {
         self.inner = Self::build_raw(&self.prefix, &self.mapping, self.headers.clone());
     }

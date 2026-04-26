@@ -38,6 +38,11 @@ lazy_static::lazy_static! {
     static ref RETRY_POLICY: RetryPolicy = RetryPolicy::fixed(Duration::from_millis(200))
         .with_max_retries(5)
         .with_jitter(true);
+
+    static ref RAW_CLIENT: reqwest::Client = reqwest::Client::builder()
+    .timeout(REQUEST_TIMEOUT)
+    .build()
+    .expect("failed to build e-hentai raw client");
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,10 +77,7 @@ fn ghost_client_builder() -> GhostClientBuilder {
 }
 
 fn raw_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .expect("failed to build e-hentai raw client")
+    RAW_CLIENT.clone()
 }
 
 fn parse_gallery_path(path: &str) -> anyhow::Result<(String, String)> {
@@ -229,14 +231,14 @@ impl EHImageStream {
 
 impl AsyncStream for EHImageStream {
     type Item = anyhow::Result<(ImageMeta, ImageData)>;
-    type Future = impl std::future::Future<Output = Self::Item>;
+    type Future = crate::stream::BoxFuture<Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         let image_page_link = self.image_page_links.next()?;
         let client = self.client.clone();
         let raw_client = self.raw_client.clone();
 
-        Some(async move {
+        Some(Box::pin(async move {
             match EHImageStream::load_image(client, raw_client, image_page_link.clone()).await {
                 Ok(r) => Ok(r),
                 Err(e) => {
@@ -244,7 +246,7 @@ impl AsyncStream for EHImageStream {
                     Err(e)
                 }
             }
-        })
+        }))
     }
 
     #[inline]

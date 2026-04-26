@@ -1,4 +1,5 @@
 use std::{borrow::Cow, str::FromStr};
+use std::pin::Pin;
 
 use futures::Future;
 use ipnet::Ipv6Net;
@@ -124,12 +125,16 @@ where
 {
     type SeacheError = anyhow::Error;
     type SearchOutput = SaucenaoOutput;
-    type FetchFuture = impl Future<Output = Result<Self::SearchOutput, Self::SeacheError>>;
+    type FetchFuture = Pin<
+    Box<
+        dyn Future<Output = Result<Self::SearchOutput, Self::SeacheError>> + Send + 'static
+        >
+    >;
 
     fn search(&self, data: T) -> Self::FetchFuture {
         let file_part = Part::bytes(data).file_name("image.jpg");
         let client = self.client.clone();
-        async move { Self::do_search(&client, file_part).await }
+        Box::pin(async move { Self::do_search(&client, file_part).await })
     }
 }
 

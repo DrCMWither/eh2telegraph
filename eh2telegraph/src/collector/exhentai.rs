@@ -35,6 +35,11 @@ lazy_static::lazy_static! {
     static ref RETRY_POLICY: RetryPolicy = RetryPolicy::fixed(Duration::from_millis(200))
         .with_max_retries(5)
         .with_jitter(true);
+
+    static ref RAW_CLIENT: reqwest::Client = reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .expect("failed to build exhentai raw client");
 }
 
 const CONFIG_KEY: &str = "exhentai";
@@ -111,19 +116,18 @@ impl ExConfig {
     }
 }
 
+fn raw_client() -> reqwest::Client {
+    RAW_CLIENT.clone()
+}
+
 impl EXCollector {
     pub fn new(config: &ExConfig, prefix: Option<Ipv6Net>) -> anyhow::Result<Self> {
-        let raw_client = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            .build()
-            .context("failed to build raw reqwest client")?;
-
         Ok(Self {
             ghost_client: GhostClientBuilder::default()
                 .with_default_headers(config.build_header()?)
                 .with_cf_resolve(&["exhentai.org"])
                 .build(prefix),
-            raw_client,
+            raw_client: raw_client(),
         })
     }
 
@@ -131,17 +135,12 @@ impl EXCollector {
         let config: ExConfig = config::parse(CONFIG_KEY)?
             .ok_or_else(|| anyhow!("exhentai config(key: exhentai) not found"))?;
 
-        let raw_client = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            .build()
-            .context("failed to build raw reqwest client")?;
-
         Ok(Self {
             ghost_client: GhostClientBuilder::default()
                 .with_default_headers(config.build_header()?)
                 .with_cf_resolve(&["exhentai.org"])
                 .build_from_config()?,
-            raw_client,
+            raw_client: raw_client(),
         })
     }
 
@@ -264,14 +263,14 @@ impl EXImageStream {
 impl AsyncStream for EXImageStream {
     type Item = anyhow::Result<(ImageMeta, ImageData)>;
 
-    type Future = impl std::future::Future<Output = Self::Item>;
+    type Future = crate::stream::BoxFuture<Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         let link = self.image_page_links.next()?;
         let ghost_client = self.ghost_client.clone();
         let raw_client = self.raw_client.clone();
 
-        Some(async move { Self::load_image(ghost_client, raw_client, link).await })
+        Some(Box::pin(async move { Self::load_image(ghost_client, raw_client, link).await }))
     }
 
     #[inline]
