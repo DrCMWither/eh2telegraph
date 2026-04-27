@@ -10,6 +10,13 @@ Bot that automatically downloads image sets from EH/EX/NH and uploads them to Te
 
 This code is not only guaranteed to work correctly on MacOS (partial functionality) and Linux, but also guaranteed to work in Windows.
 
+## Performance Improvements
+As a heavily optimized fork, this project significantly reduces memory footprint and CPU overhead compared to the upstream repository.
+
+Below is a profiling comparison between the original upstream version (Before) and our refactored version (After):
+
+![[./assets/metrics.svg]]
+
 ## Docker-free Deployment Guidelines
 
 ### Windows
