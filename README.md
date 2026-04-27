@@ -15,7 +15,7 @@ As a heavily optimized fork, this project significantly reduces memory footprint
 
 Below is a profiling comparison between the original upstream version (Before) and our refactored version (After):
 
-![[./assets/metrics.svg]]
+<img src=https://github.com/DrCMWither/eh2telegraph/blob/master/assets/metrics.svg width=300 />
 
 ## Docker-free Deployment Guidelines
 
