@@ -7,7 +7,6 @@ version = "0.1.0"
 again = { version = "0.1", default-features = false, features = ["rand"] }
 anyhow = "1"
 bytes = "1"
-cloudflare-kv-proxy = "0.2"
 derive_more = { version = "0.99", features = ["from_str"] }
 futures = "0.3"
 hashlink = "0.9"
