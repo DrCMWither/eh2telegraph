@@ -10,12 +10,12 @@ use tokio::time::timeout;
 use crate::{
     http_client::{GhostClient, GhostClientBuilder},
     stream::AsyncStream,
-    util::{get_bytes, get_string, match_first_group},
+    util::{ get_string, match_first_group},
 };
 
 use super::{
     utils::paged::{PageFormatter, PageIndicator, Paged},
-    AlbumMeta, Collector, ImageData, ImageMeta,
+    AlbumMeta, Collector, ImageMeta,
 };
 
 const HOST: &str = "e-hentai.org";
@@ -23,7 +23,6 @@ const COOKIE_NW: &str = "nw=1";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_PAGE_TIMEOUT: Duration = Duration::from_secs(20);
-const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(40);
 
 lazy_static::lazy_static! {
     static ref PAGE_RE: Regex =
@@ -48,21 +47,18 @@ lazy_static::lazy_static! {
 #[derive(Debug, Clone, Default)]
 pub struct EHCollector {
     client: GhostClient,
-    raw_client: reqwest::Client,
 }
 
 impl EHCollector {
     pub fn new(prefix: Option<Ipv6Net>) -> Self {
         Self {
             client: ghost_client_builder().build(prefix),
-            raw_client: raw_client(),
         }
     }
 
     pub fn new_from_config() -> anyhow::Result<Self> {
         Ok(Self {
             client: ghost_client_builder().build_from_config()?,
-            raw_client: raw_client(),
         })
     }
 }
@@ -74,10 +70,6 @@ fn ghost_client_builder() -> GhostClientBuilder {
     GhostClientBuilder::default()
         .with_default_headers(request_headers)
         .with_cf_resolve(&[HOST])
-}
-
-fn raw_client() -> reqwest::Client {
-    RAW_CLIENT.clone()
 }
 
 fn parse_gallery_path(path: &str) -> anyhow::Result<(String, String)> {
@@ -175,7 +167,6 @@ impl Collector for EHCollector {
             },
             EHImageStream {
                 client,
-                raw_client: self.raw_client.clone(),
                 image_page_links: image_page_links.into_iter(),
             },
         ))
@@ -185,16 +176,14 @@ impl Collector for EHCollector {
 #[derive(Debug)]
 pub struct EHImageStream {
     client: GhostClient,
-    raw_client: reqwest::Client,
     image_page_links: std::vec::IntoIter<String>,
 }
 
 impl EHImageStream {
-    async fn load_image(
+    async fn load_image_meta(
         client: GhostClient,
-        raw_client: reqwest::Client,
         image_page_link: String,
-    ) -> anyhow::Result<(ImageMeta, ImageData)> {
+    ) -> anyhow::Result<ImageMeta> {
         let content = timeout(
             IMAGE_PAGE_TIMEOUT,
             RETRY_POLICY.retry(|| async { get_string(&client, &image_page_link).await }),
@@ -206,50 +195,33 @@ impl EHImageStream {
             .ok_or_else(|| anyhow::anyhow!("unable to find image in page: {image_page_link}"))?
             .to_string();
 
-        let image_data = timeout(
-            IMAGE_DOWNLOAD_TIMEOUT,
-            RETRY_POLICY.retry(|| async { get_bytes(&raw_client, &img_url).await }),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("e-hentai image download timed out: {img_url}"))??;
-
-        tracing::trace!(
-            "download e-hentai image with size {}, page: {image_page_link}",
-            image_data.len()
-        );
-
-        Ok((
-            ImageMeta {
-                id: image_page_link,
-                url: img_url,
-                description: None,
-            },
-            image_data,
-        ))
+        Ok(ImageMeta {
+            id: image_page_link,
+            url: img_url,
+            description: None,
+        })
     }
 }
 
 impl AsyncStream for EHImageStream {
-    type Item = anyhow::Result<(ImageMeta, ImageData)>;
+    type Item = anyhow::Result<ImageMeta>;
     type Future = crate::stream::BoxFuture<Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         let image_page_link = self.image_page_links.next()?;
         let client = self.client.clone();
-        let raw_client = self.raw_client.clone();
 
         Some(Box::pin(async move {
-            match EHImageStream::load_image(client, raw_client, image_page_link.clone()).await {
+            match EHImageStream::load_image_meta(client, image_page_link.clone()).await {
                 Ok(r) => Ok(r),
                 Err(e) => {
-                    tracing::error!("e-hentai image failed: {image_page_link}: {e}");
+                    tracing::error!("e-hentai image meta failed: {image_page_link}: {e}");
                     Err(e)
                 }
             }
         }))
     }
 
-    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.image_page_links.size_hint()
     }
@@ -296,9 +268,8 @@ mod tests {
         println!("album: {album:?}");
 
         let maybe_first_image = image_stream.next().unwrap().await;
-        if let Ok((meta, data)) = maybe_first_image {
+        if let Ok(meta) = maybe_first_image {
             println!("first image meta: {meta:?}");
-            println!("first image data length: {}", data.len());
         }
     }
 

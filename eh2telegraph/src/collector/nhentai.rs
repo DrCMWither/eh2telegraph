@@ -14,7 +14,7 @@ use crate::{
     stream::AsyncStream,
     types::NhTag,
 };
-use super::{AlbumMeta, Collector, ImageData, ImageMeta};
+use super::{AlbumMeta, Collector, ImageMeta};
 
 const NHAPI: &str = "https://nhapi.cat42.uk/gallery/";
 
@@ -211,14 +211,13 @@ impl Collector for NHCollector {
                         .collect::<Vec<_>>()
                 ),
             },
-            NHImageStream { client, image_urls },
+            NHImageStream { image_urls },
         ))
     }
 }
 
 #[derive(Debug)]
 struct ImageURL {
-    raw: String,
     media: String,
     id: usize,
     typ: ImageType,
@@ -226,16 +225,7 @@ struct ImageURL {
 
 impl ImageURL {
     fn new(media: String, id: usize, typ: ImageType) -> Self {
-        Self {
-            raw: Self::random_cdn_link(&media, id, typ),
-            media,
-            id,
-            typ,
-        }
-    }
-
-    fn raw(&self) -> &str {
-        &self.raw
+        Self { media, id, typ }
     }
 
     fn fallback(&self) -> String {
@@ -252,69 +242,23 @@ impl ImageURL {
 
 #[derive(Debug)]
 pub struct NHImageStream {
-    client: GhostClient,
     image_urls: std::vec::IntoIter<ImageURL>,
 }
 
-impl NHImageStream {
-    async fn load_image(client: GhostClient, link: &str) -> anyhow::Result<(ImageMeta, ImageData)> {
-        let resp = timeout(
-            Duration::from_secs(20),
-            client.get(link).send(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("image request timed out: {link}"))??;
-
-        let resp = resp.error_for_status()?;
-
-        let data = timeout(
-            Duration::from_secs(30),
-            resp.bytes(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("image body read timed out: {link}"))??;
-
-        let meta = ImageMeta {
-            id: link.to_string(),
-            url: link.to_string(),
-            description: None,
-        };
-
-        Ok((meta, data))
-    }
-
-    async fn load_image_meta_only(link: &str) -> anyhow::Result<(ImageMeta, ImageData)> {
-        let meta = ImageMeta {
-            id: link.to_string(),
-            url: link.to_string(),
-            description: None,
-        };
-        Ok((meta, bytes::Bytes::new()))
-    }
-}
 
 impl AsyncStream for NHImageStream {
-    type Item = anyhow::Result<(ImageMeta, ImageData)>;
+    type Item = anyhow::Result<ImageMeta>;
     type Future = crate::stream::BoxFuture<Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         let link = self.image_urls.next()?;
-        let client = self.client.clone();
-
+        let url = link.fallback();
         Some(Box::pin(async move {
-            match NHImageStream::load_image(client.clone(), link.raw()).await {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    tracing::error!("fallback for nh image {link:?}: {e}");
-                    match NHImageStream::load_image(client, &link.fallback()).await {
-                        Ok(r) => Ok(r),
-                        Err(e2) => {
-                            tracing::error!("nh image failed finally {link:?}: {e2}");
-                            NHImageStream::load_image_meta_only(link.raw()).await
-                        }
-                    }
-                }
-            }
+            Ok(ImageMeta {
+                id: url.clone(),
+                url,
+                description: None,
+            })
         }))
     }
 

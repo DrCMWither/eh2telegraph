@@ -6,18 +6,21 @@ use ipnet::Ipv6Net;
 use regex::Regex;
 use reqwest::header::{self, HeaderMap};
 use serde::Deserialize;
+use tokio::time::timeout;
 
 use crate::{
     config,
     http_client::{GhostClient, GhostClientBuilder},
     stream::AsyncStream,
-    util::{get_bytes, get_string, match_first_group},
+    util::{get_string, match_first_group},
 };
 
 use super::{
     utils::paged::{PageFormatter, PageIndicator, Paged},
-    AlbumMeta, Collector, ImageData, ImageMeta,
+    AlbumMeta, Collector, ImageMeta,
 };
+
+const IMAGE_PAGE_TIMEOUT: Duration = Duration::from_secs(20);
 
 lazy_static::lazy_static! {
     static ref PAGE_RE: Regex =
@@ -209,7 +212,6 @@ impl Collector for EXCollector {
                 tags: None,
             },
             EXImageStream {
-                raw_client: self.raw_client.clone(),
                 ghost_client: self.ghost_client.clone(),
                 image_page_links: image_page_links.into_iter(),
             },
@@ -219,58 +221,44 @@ impl Collector for EXCollector {
 
 #[derive(Debug)]
 pub struct EXImageStream {
-    raw_client: reqwest::Client,
     ghost_client: GhostClient,
     image_page_links: std::vec::IntoIter<String>,
 }
 
 impl EXImageStream {
     async fn load_image(
-        ghost_client: GhostClient,
-        raw_client: reqwest::Client,
-        link: String,
-    ) -> anyhow::Result<(ImageMeta, ImageData)> {
-        let content = RETRY_POLICY
-            .retry(|| async { get_string(&ghost_client, &link).await })
-            .await
-            .with_context(|| format!("[exhentai] failed to load image page {link}"))?;
+        client: GhostClient,
+        image_page_link: String,
+    ) -> anyhow::Result<ImageMeta> {
+        let content = timeout(
+            IMAGE_PAGE_TIMEOUT,
+            RETRY_POLICY.retry(|| async { get_string(&client, &image_page_link).await }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("exhentai image page request timed out: {image_page_link}"))??;
 
         let img_url = match_first_group(&IMG_RE, &content)
-            .ok_or_else(|| anyhow!("[exhentai] unable to find image url in page {link}"))?
-            .to_owned();
+            .ok_or_else(|| anyhow::anyhow!("unable to find image in page: {image_page_link}"))?
+            .to_string();
 
-        let image_data = RETRY_POLICY
-            .retry(|| async { get_bytes(&raw_client, &img_url).await })
-            .await
-            .with_context(|| format!("[exhentai] failed to download image {img_url}"))?;
-
-        tracing::trace!(
-            "download exhentai image with size {}, page link: {link}",
-            image_data.len()
-        );
-
-        Ok((
-            ImageMeta {
-                id: link,
-                url: img_url,
-                description: None,
-            },
-            image_data,
-        ))
+        Ok(ImageMeta {
+            id: image_page_link,
+            url: img_url,
+            description: None,
+        })
     }
 }
 
 impl AsyncStream for EXImageStream {
-    type Item = anyhow::Result<(ImageMeta, ImageData)>;
+    type Item = anyhow::Result<ImageMeta>;
 
     type Future = crate::stream::BoxFuture<Self::Item>;
 
     fn next(&mut self) -> Option<Self::Future> {
         let link = self.image_page_links.next()?;
         let ghost_client = self.ghost_client.clone();
-        let raw_client = self.raw_client.clone();
 
-        Some(Box::pin(async move { Self::load_image(ghost_client, raw_client, link).await }))
+        Some(Box::pin(async move { Self::load_image(ghost_client, link).await }))
     }
 
     #[inline]

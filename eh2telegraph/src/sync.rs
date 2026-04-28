@@ -1,7 +1,6 @@
 use crate::{
-    buffer::{DataSized, ImageBuffer},
     collector::{
-        AlbumMeta, Collector, ImageData, ImageMeta, Param, Registry, URL_FROM_TEXT_RE,
+        AlbumMeta, Collector, ImageMeta, Param, Registry, URL_FROM_TEXT_RE,
         URL_FROM_URL_RE,
     },
     http_proxy::ProxiedClient,
@@ -9,15 +8,13 @@ use crate::{
     stream::{AsyncStream, Buffered},
     telegraph::{
         types::{Node, NodeElement, NodeElementAttr, Page, PageCreate, Tag},
-        RandomAccessToken, Telegraph, TelegraphError, MAX_SINGLE_FILE_SIZE,
+        RandomAccessToken, Telegraph, TelegraphError,
     },
     util::match_first_group,
     util::public_image_url,
 };
 
 const ERR_THRESHOLD: usize = 10;
-const BATCH_LEN_THRESHOLD: usize = 20;
-const BATCH_SIZE_THRESHOLD: usize = 5 * 1024 * 1024;
 const DEFAULT_CONCURRENT: usize = 20;
 
 #[derive(thiserror::Error, Debug)]
@@ -153,7 +150,7 @@ where
     ) -> Result<Page, UploadError<SE>>
     where
         SE: Send + std::fmt::Debug + 'static,
-        S: AsyncStream<Item = Result<(ImageMeta, ImageData), SE>>,
+        S: AsyncStream<Item = Result<ImageMeta, SE>>,
         S::Future: Send + 'static,
     {
         let buffered_stream = Buffered::new(stream, self.limit.unwrap_or(DEFAULT_CONCURRENT));
@@ -175,77 +172,33 @@ where
         mut stream: S,
     ) -> Result<Page, UploadError<SE>>
     where
-        S: AsyncStream<Item = Result<(ImageMeta, ImageData), SE>>,
+        S: AsyncStream<Item = Result<ImageMeta, SE>>,
     {
         let mut err_count = 0;
         let mut uploaded = Vec::new();
 
-        let mut buffer = ImageBuffer::new();
-
-        // in this big loop, we will download images, and upload them in batch.
-        // then, all meta info will be saved in `uploaded`.
-        loop {
-            while let Some(fut) = stream.next() {
-                let data = match fut.await {
-                    Err(e) => {
-                        err_count += 1;
-                        if err_count > ERR_THRESHOLD {
-                            return Err(UploadError::Stream(e));
-                        }
-                        continue;
+        while let Some(fut) = stream.next() {
+            let image_meta = match fut.await {
+                Err(e) => {
+                    err_count += 1;
+                    if err_count > ERR_THRESHOLD {
+                        return Err(UploadError::Stream(e));
                     }
-                    Ok(d) => {
-                        err_count = 0;
-                        d
-                    }
-                };
-        
-                if data.1.len() >= MAX_SINGLE_FILE_SIZE {
-                    tracing::error!("Too big file, discarded. Meta: {:?}", data.0);
                     continue;
                 }
-        
-                buffer.push(data);
-                if buffer.len() > BATCH_LEN_THRESHOLD || buffer.size() > BATCH_SIZE_THRESHOLD {
-                    break;
+                Ok(meta) => {
+                    err_count = 0;
+                    meta
                 }
-            }
-        
-            if buffer.is_empty() {
-                break;
-            }
-        
-            let (full_data, size) = buffer.swap();
-            let image_count = full_data.len();
-            tracing::debug!("download {image_count} images with size {size}, will upload them");
-        
-            let (meta, _data) = full_data
-                .into_iter()
-                .map(|(a, b)| (a, b.as_ref().to_owned()))
-                .unzip::<_, _, Vec<_>, Vec<_>>();
-        
-            let proxied_urls = meta
-                .iter()
-                .map(|m| public_image_url(&self.image_proxy_base, &m.url))
-                .collect::<Vec<_>>();
-        
-            err_count = 0;
-        
-            tracing::info!("proxy image count: {}", proxied_urls.len());
-        
-            for (meta, src) in meta.into_iter().zip(proxied_urls.into_iter()) {
-                tracing::info!("proxy image src = {}", src);
-                uploaded.push(UploadedImage { meta, src });
-            }
+            };
+            let src = public_image_url(&self.image_proxy_base, &image_meta.url);
+            tracing::info!("proxy image src = {}", src);
+            uploaded.push(UploadedImage {
+                meta: image_meta,
+                src,
+            });
         }
-        
         tracing::info!("uploaded total count after loop = {}", uploaded.len());
-        for img in &uploaded {
-            tracing::info!("uploaded total src = {}", img.src);
-        }
-
-        // create telegraph page, or multi pages
-        // Telegraph has 64K limit, since our estimate is not accurate, here we use 48K.
         const PAGE_SIZE_LIMIT: usize = 48 * 1024;
         let mut chunks = Vec::with_capacity(8);
         chunks.push(Vec::new());
@@ -315,13 +268,6 @@ impl Synchronizer {
 
     pub fn match_url_from_url(content: &str) -> Option<&str> {
         match_first_group(&URL_FROM_URL_RE, content)
-    }
-}
-
-impl DataSized for (ImageMeta, ImageData) {
-    #[inline]
-    fn size(&self) -> usize {
-        self.1.size()
     }
 }
 

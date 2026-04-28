@@ -41,7 +41,7 @@ pub struct AlbumMeta {
 pub trait Collector {
     type FetchError;
     type StreamError;
-    type ImageStream: AsyncStream<Item = Result<(ImageMeta, ImageData), Self::StreamError>>;
+    type ImageStream: AsyncStream<Item = Result<ImageMeta, Self::StreamError>>;
 
     fn name() -> &'static str;
     fn fetch(
