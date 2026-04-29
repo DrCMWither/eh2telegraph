@@ -38,13 +38,10 @@ where
     }
 
     #[inline]
-    pub fn swap(&mut self) -> (Vec<T>, usize) {
-        let mut out = Vec::with_capacity(self.buf.len() * 2);
-        std::mem::swap(&mut self.buf, &mut out);
-
-        let mut size = 0;
-        std::mem::swap(&mut self.size, &mut size);
-        (out, size)
+    pub fn flush(&mut self) -> (Vec<T>, usize) {
+        let buf = std::mem::flush(&mut self.buf);
+        let size = std::mem::flush(&mut self.size);
+        (buf, size)
     }
 
     #[inline]
