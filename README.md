@@ -15,7 +15,7 @@ As a heavily optimized fork, this project significantly reduces memory footprint
 
 Below is a profiling comparison between the original upstream version (Before) and our refactored version (After):
 
-![Performance](/assets/metrics.svg)
+![Performance](./assets/metrics.svg)
 
 ## Docker-free Deployment Guidelines
 
