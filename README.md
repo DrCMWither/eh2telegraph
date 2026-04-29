@@ -6,16 +6,27 @@ This project is a heavily optimized and refactored fork of [qini7-sese/eh2telegr
 
 The original contributors of the upstream project are not associated with this fork, and hold no responsibility for the code quality, stability, security, or ongoing maintenance of this repository. For any issues, bug reports, or feature requests, please open an issue in this repository directly and refrain from contacting the original authors.
 
-Bot that automatically downloads image sets from EH/EX/NH and uploads them to Telegraph.
+Bot that fetches image sets from EH/EX/NH and generates Telegraph pages.
 
-This code is not only guaranteed to work correctly on MacOS (partial functionality) and Linux, but also guaranteed to work in Windows.
+After revoking `native-tls`, this fork aims to support macOS, Linux, and Windows.
+
+**This project depends on a Cloudflare Worker proxy for image delivery.**
+
+If the proxy is unavailable or blocked:
+- Images in generated Telegraph pages may not load
+- Existing pages may become partially broken
+
+**For production use, it is strongly recommended to deploy your own Worker.**
 
 ## Performance Improvements
+
 As a heavily optimized fork, this project significantly reduces memory footprint and CPU overhead compared to the upstream repository.
 
 Below is a profiling comparison between the original upstream version (Before) and our refactored version (After):
 
 ![Performance](./assets/metrics.svg)
+
+*Note: The performance gain mainly comes from TLS clients reusing (~90% tmp alloc), memory-intensive code minimising (~40% mem leak), and yet, the most CPU offload benefits attributed to eliminating image downloads and re-uploads, which changes the delivery model to proxy-based embedding.*
 
 ## Docker-free Deployment Guidelines
 
@@ -183,15 +194,17 @@ sudo systemctl restart eh2telegraph
 
 ## Deployment Guidelines via Docker
 
+Docker deployment is still supported, but this fork primarily documents Docker-free deployment for easier manual operation and debugging.
+
 1. Install Docker and docker-compose.
 
 2. Create a new folder `ehbot`.
 
-2. Copy `config_example.yaml` from the project to `ehbot` and rename it to `config.yaml`, then change the configuration details (see the next section).
+3. Copy `config_example.yaml` from the project to `ehbot` and rename it to `config.yaml`, then change the configuration details (see the next section).
 
-3. Copy `docker-compose.yml` to `ehbot`.
+4. Copy `docker-compose.yml` to `ehbot`.
 
-4. Start and Shutdown.
+5. Start and Shutdown.
 
     1. Start: Run `docker-compose up -d` in this folder.
 
@@ -241,21 +254,21 @@ sudo systemctl restart eh2telegraph
 
 ### Environment
 
-Requires the latest Nightly version of Rust. Recommended to use VSCode or Clion for development.
+This project is fully compatible with stable Rust (>=1.95), **no nightly features are required.** Recommended to use VSCode or Clion for development.
 
 [RsProxy](https://rsproxy.cn/) is recommended as the crates.io source and toolchain installation source for users in China Mainland.
 
 ### Version Release
 
-A Docker build can be triggered by typing a Tag starting with `v`. You can type the tag directly in git and push it up; however, it is easier to publish the release in github and fill in the `v` prefix.
+A Docker build can be triggered by typing a Tag starting with `v`. You can type the tag directly in git and push it up; however, it is easier to publish the release in GitHub and fill in the `v` prefix.
 
 ## Technical Details
 
 Although this project is a simple crawler, there are still some considerations that need to be explained.
 
-### Github Action Builds
+### GitHub Action Builds
 
-Github Action can be used to automatically build Docker images, and this project supports automatic builds for the `x86_64` platform.
+GitHub Action can be used to automatically build Docker images, and this project supports automatic builds for the `x86_64` platform.
 
 However, it can also build `arm64` versions, but it is not enabled because it uses qemu to emulate the arm environment on x86_64, so it is extremely slow (more than 1h for a single build).
 
@@ -304,6 +317,18 @@ This project uses Cloudflare Workers as a partial API proxy to alleviate the flo
 To minimize duplicate pulls, this project uses in-memory caching and remote persistent caching. Remote persistent cache using Cloudflare Worker with Cloudflare KV to build. The main project code reference is [cloudflare-kv-proxy](https://github.com/ihciah/cloudflare-kv-proxy).
 
 Since it takes some time to synchronize image sets, to avoid repeated synchronization, this project uses [singleflight-async](https://github.com/ihciah/singleflight-async) to reduce this kind of waste.
+
+### Image Embedding Proxy?
+
+Since telegra.ph removed `upload` API for image due to the excessive spam and abuse in 2024, the original repo is no longer reliable. Instead, this fork employs an image embedding proxy strategy to make it still available. Currently, the image embedding proxy code is coupled with the legacy `worker/web_proxy.js`.
+
+### Benchmark Methodology
+
+- Dataset: 10 batches, 3 EH/NH galleries(~100 pages total) for each batches
+- Environment: AMD Ryzen 9 7940H / 96G RAM / Ubuntu
+- Tooling: heaptrack / perf / samply
+
+*Benchmark scripts are not included yet, results are indicative.*
 
 ## Contribute Guidelines
 
