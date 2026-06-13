@@ -239,16 +239,14 @@ impl Node {
         Node::NodeElement(NodeElement {
             tag: Tag::Figure,
             attrs: None,
-            children: Some(vec![
-                Node::NodeElement(NodeElement {
-                    tag: Tag::Img,
-                    attrs: Some(NodeElementAttr {
-                        src: Some(src.into()),
-                        href: None,
-                    }),
-                    children: None,
-                })
-            ]),
+            children: Some(vec![Node::NodeElement(NodeElement {
+                tag: Tag::Img,
+                attrs: Some(NodeElementAttr {
+                    src: Some(src.into()),
+                    href: None,
+                }),
+                children: None,
+            })]),
         })
     }
 }

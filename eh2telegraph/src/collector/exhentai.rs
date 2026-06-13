@@ -69,10 +69,7 @@ struct GalleryPath {
 
 impl GalleryPath {
     fn parse(path: &str) -> anyhow::Result<Self> {
-        let parts = path
-            .trim_matches('/')
-            .split('/')
-            .collect::<Vec<_>>();
+        let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
 
         match parts.as_slice() {
             ["g", album_id, album_token, ..]
@@ -226,16 +223,15 @@ pub struct EXImageStream {
 }
 
 impl EXImageStream {
-    async fn load_image(
-        client: GhostClient,
-        image_page_link: String,
-    ) -> anyhow::Result<ImageMeta> {
+    async fn load_image(client: GhostClient, image_page_link: String) -> anyhow::Result<ImageMeta> {
         let content = timeout(
             IMAGE_PAGE_TIMEOUT,
             RETRY_POLICY.retry(|| async { get_string(&client, &image_page_link).await }),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("exhentai image page request timed out: {image_page_link}"))??;
+        .map_err(|_| {
+            anyhow::anyhow!("exhentai image page request timed out: {image_page_link}")
+        })??;
 
         let img_url = match_first_group(&IMG_RE, &content)
             .ok_or_else(|| anyhow::anyhow!("unable to find image in page: {image_page_link}"))?
@@ -258,7 +254,9 @@ impl AsyncStream for EXImageStream {
         let link = self.image_page_links.next()?;
         let ghost_client = self.ghost_client.clone();
 
-        Some(Box::pin(async move { Self::load_image(ghost_client, link).await }))
+        Some(Box::pin(async move {
+            Self::load_image(ghost_client, link).await
+        }))
     }
 
     #[inline]

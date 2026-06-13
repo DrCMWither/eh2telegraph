@@ -55,7 +55,6 @@ where
     })
 }
 
-
 pub fn esc<S: AsRef<str>>(s: S) -> String {
     escape(s.as_ref())
 }

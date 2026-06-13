@@ -1,5 +1,5 @@
-use std::{borrow::Cow, str::FromStr};
 use std::pin::Pin;
+use std::{borrow::Cow, str::FromStr};
 
 use futures::Future;
 use ipnet::Ipv6Net;
@@ -126,9 +126,7 @@ where
     type SeacheError = anyhow::Error;
     type SearchOutput = SaucenaoOutput;
     type FetchFuture = Pin<
-    Box<
-        dyn Future<Output = Result<Self::SearchOutput, Self::SeacheError>> + Send + 'static
-        >
+        Box<dyn Future<Output = Result<Self::SearchOutput, Self::SeacheError>> + Send + 'static>,
     >;
 
     fn search(&self, data: T) -> Self::FetchFuture {

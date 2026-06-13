@@ -1,8 +1,8 @@
 use crate::{
     collector::{
-        AlbumMeta, Collector, ImageMeta, Param, Registry, URL_FROM_TEXT_RE,
-        URL_FROM_URL_RE,
+        AlbumMeta, Collector, ImageMeta, Param, Registry, URL_FROM_TEXT_RE, URL_FROM_URL_RE,
     },
+    http_client::rand_ua,
     http_proxy::ProxiedClient,
     storage::{cloudflare_kv::CFStorage, KVStorage},
     stream::{AsyncStream, Buffered},
@@ -13,9 +13,15 @@ use crate::{
     util::match_first_group,
     util::public_image_url,
 };
+use futures::{stream, StreamExt};
+use reqwest::header::USER_AGENT;
+use std::time::Duration;
 
 const ERR_THRESHOLD: usize = 10;
 const DEFAULT_CONCURRENT: usize = 20;
+
+const PREWARM_CONCURRENT: usize = 8;
+const PREWARM_TIMEOUT_SECS: u64 = 30;
 
 #[derive(thiserror::Error, Debug)]
 pub enum UploadError<SE> {
@@ -43,6 +49,7 @@ pub struct Synchronizer<C = CFStorage> {
     cache_ttl: Option<usize>,
 
     registry: Registry,
+    prewarm_client: reqwest::Client,
     cache: C,
 }
 
@@ -66,6 +73,10 @@ where
             author_url: None,
             cache_ttl: None,
             registry,
+            prewarm_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(PREWARM_TIMEOUT_SECS))
+                .build()
+                .expect("unable to build prewarm reqwest client"),
             cache,
             image_proxy_base,
         }
@@ -86,7 +97,64 @@ where
         self.cache_ttl = ttl;
         self
     }
+    async fn prewarm_page(&self, page_url: &str, image_urls: Vec<String>) {
+        tracing::info!(
+            "[prewarm] fetching Telegraph page {} and {} image(s)",
+            page_url,
+            image_urls.len()
+        );
 
+        if let Err(e) = prewarm_fetch(self.prewarm_client.clone(), page_url.to_owned()).await {
+            tracing::warn!("[prewarm] failed to fetch Telegraph page {}: {}", page_url, e);
+        }
+
+        let total = image_urls.len();
+        if total == 0 {
+            return;
+        }
+
+        let client = self.prewarm_client.clone();
+        let mut tasks = stream::iter(image_urls.into_iter().map(move |url| {
+            let client = client.clone();
+            async move {
+                let display_url = url.clone();
+                prewarm_fetch(client, url)
+                    .await
+                    .map_err(|e| (display_url, e))
+            }
+        }))
+        .buffer_unordered(PREWARM_CONCURRENT);
+
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+
+        while let Some(result) = tasks.next().await {
+            match result {
+                Ok(()) => ok += 1,
+                Err((url, e)) => {
+                    failed += 1;
+                    tracing::warn!("[prewarm] failed to fetch image {}: {}", url, e);
+                }
+            }
+        }
+
+        if failed == 0 {
+            tracing::info!(
+                "[prewarm] finished Telegraph page {}; warmed {}/{} image(s)",
+                page_url,
+                ok,
+                total
+            );
+        } else {
+            tracing::warn!(
+                "[prewarm] finished Telegraph page {}; warmed {}/{} image(s), failed {}",
+                page_url,
+                ok,
+                total,
+                failed
+            );
+        }
+    }
     pub async fn delete_cache(&self, key: &str) -> anyhow::Result<()> {
         self.cache.delete(key).await
     }
@@ -227,6 +295,7 @@ where
                 n => format!("{}-Page{}", title, n + 1),
             };
             tracing::debug!("create page with content: {content:?}");
+            let image_urls = collect_image_urls(&content);
             let page = self
                 .tg
                 .create_page(&PageCreate {
@@ -241,11 +310,60 @@ where
                 .await
                 .map_err(UploadError::Reqwest)?;
 
+            self.prewarm_page(&page.url, image_urls).await;
+
             last_page = Some(page);
         }
         Ok(last_page.unwrap())
     }
 }
+
+async fn prewarm_fetch(client: reqwest::Client, url: String) -> reqwest::Result<()> {
+    let resp = client
+        .get(&url)
+        .header(USER_AGENT, rand_ua())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    drain_response(resp).await
+}
+
+async fn drain_response(mut resp: reqwest::Response) -> reqwest::Result<()> {
+    while resp.chunk().await?.is_some() {}
+    Ok(())
+}
+
+fn collect_image_urls(content: &[Node]) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    for node in content {
+        collect_image_urls_from_node(node, &mut urls);
+    }
+
+    urls
+}
+
+fn collect_image_urls_from_node(node: &Node, urls: &mut Vec<String>) {
+    if let Node::NodeElement(element) = node {
+        if let Some(attrs) = &element.attrs {
+            if let Some(src) = &attrs.src {
+                urls.push(if src.starts_with("http://") || src.starts_with("https://") {
+                    src.clone()
+                } else {
+                    format!("https://telegra.ph{}", src)
+                });
+            }
+        }
+
+        if let Some(children) = &element.children {
+            for child in children {
+                collect_image_urls_from_node(child, urls);
+            }
+        }
+    }
+}
+
 
 fn write_footer(content: &mut Vec<Node>, original_link: &str, next_page: Option<&str>) {
     if let Some(page) = next_page {

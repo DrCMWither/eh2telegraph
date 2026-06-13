@@ -8,7 +8,7 @@ The original contributors of the upstream project are not associated with this f
 
 Bot that fetches image sets from EH/EX/NH and generates Telegraph pages.
 
-After revoking `native-tls`, this fork aims to support macOS, Linux, and Windows.
+After removing `native-tls`, this fork aims to support macOS, Linux, and Windows.
 
 **This project depends on a Cloudflare Worker proxy for image delivery.**
 
@@ -26,7 +26,7 @@ Below is a profiling comparison between the original upstream version (Before) a
 
 ![Performance](./assets/metrics.svg)
 
-*Note: The performance gain mainly comes from TLS clients reusing (~90% tmp alloc), memory-intensive code minimising (~40% mem leak), and yet, the most CPU offload benefits attributed to eliminating image downloads and re-uploads, which changes the delivery model to proxy-based embedding.*
+*Note: The performance gain mainly comes from TLS clients reusing (~90% tmp alloc), memory-intensive code minimising (~40% reachable mem leak), and yet, the most CPU offload benefits attributed to eliminating image downloads and re-uploads, which changes the delivery model to proxy-based embedding. Thw Snapshot was obtained from commit 1c4e948*
 
 ## Docker-free Deployment Guidelines
 
@@ -320,7 +320,7 @@ Since it takes some time to synchronize image sets, to avoid repeated synchroniz
 
 ### Image Embedding Proxy?
 
-Since telegra.ph removed `upload` API for image due to the excessive spam and abuse in 2024, the original repo is no longer reliable. Instead, this fork employs an image embedding proxy strategy to make it still available. Currently, the image embedding proxy code is coupled with the legacy `worker/web_proxy.js`.
+Since telegra.ph revoked `upload` API for image due to the excessive spam and abuse in 2024, the original repo is no longer reliable. Instead, this fork employs an image embedding proxy strategy to make it still available. Currently, the image embedding proxy code is coupled with the legacy `worker/web_proxy.js`.
 
 ### Benchmark Methodology
 

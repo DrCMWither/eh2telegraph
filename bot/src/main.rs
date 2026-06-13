@@ -7,10 +7,10 @@ use eh2telegraph::{
     telegraph::Telegraph,
 };
 
-use std::time::Duration;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
@@ -21,10 +21,10 @@ use clap::Parser;
 use teloxide::{
     adaptors::DefaultParseMode,
     error_handlers::IgnoringErrorHandler,
+    net::client_from_env,
     prelude::*,
     types::{AllowedUpdate, ChatPermissions, ParseMode, UpdateKind},
     update_listeners,
-    net::client_from_env,
 };
 
 use tracing::level_filters::LevelFilter;
@@ -59,8 +59,12 @@ pub struct BaseConfig {
     pub restart_delay_secs: u64,
 }
 
-fn default_polling_timeout() -> u64 { 10 }
-fn default_restart_delay()   -> u64 { 5  }
+fn default_polling_timeout() -> u64 {
+    10
+}
+fn default_restart_delay() -> u64 {
+    5
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct TelegraphConfig {
@@ -133,7 +137,9 @@ async fn wait_for_shutdown_signal() {
 
 #[cfg(not(unix))]
 async fn wait_for_shutdown_signal() {
-    tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl_c");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for ctrl_c");
 }
 
 #[tokio::main]
@@ -158,8 +164,8 @@ async fn main() -> anyhow::Result<()> {
     // ---- static init: only do once ----
     config::init(args.config);
 
-    let base_config: BaseConfig = config::parse("base")?
-        .ok_or_else(|| anyhow::anyhow!("base config missing or empty"))?;
+    let base_config: BaseConfig =
+        config::parse("base")?.ok_or_else(|| anyhow::anyhow!("base config missing or empty"))?;
     let image_proxy_config: ImageProxyConfig = config::parse("image_proxy")?
         .ok_or_else(|| anyhow::anyhow!("image_proxy config missing or empty"))?;
 
@@ -175,12 +181,8 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(debug_assertions))]
     let cache = storage::cloudflare_kv::CFOrMemStorage::new_from_config()?;
 
-    let mut synchronizer = Synchronizer::new(
-        telegraph,
-        registry,
-        cache,
-        image_proxy_config.base_url,
-    );
+    let mut synchronizer =
+        Synchronizer::new(telegraph, registry, cache, image_proxy_config.base_url);
 
     if telegraph_config.author_name.is_some() {
         synchronizer =
@@ -192,39 +194,27 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- handler closures: only build once ----
     let command_handler = wrap3param(handler.clone(), |handler, bot, message, command| {
-        Box::pin(async move {
-            handler.respond_cmd(bot, message, command).await
-        })
+        Box::pin(async move { handler.respond_cmd(bot, message, command).await })
     });
 
     let admin_command_handler = wrap3param(handler.clone(), |handler, bot, message, command| {
-        Box::pin(async move {
-            handler.respond_admin_cmd(bot, message, command).await
-        })
+        Box::pin(async move { handler.respond_admin_cmd(bot, message, command).await })
     });
 
     let text_handler = wrap2param(handler.clone(), |handler, bot, message| {
-        Box::pin(async move {
-            handler.respond_text(bot, message).await
-        })
+        Box::pin(async move { handler.respond_text(bot, message).await })
     });
 
     let caption_handler = wrap2param(handler.clone(), |handler, bot, message| {
-        Box::pin(async move {
-            handler.respond_caption(bot, message).await
-        })
+        Box::pin(async move { handler.respond_caption(bot, message).await })
     });
 
     let photo_handler = wrap2param(handler.clone(), |handler, bot, message| {
-        Box::pin(async move {
-            handler.respond_photo(bot, message).await
-        })
+        Box::pin(async move { handler.respond_photo(bot, message).await })
     });
 
     let default_handler = wrap2param(handler.clone(), |handler, bot, message| {
-        Box::pin(async move {
-            handler.respond_default(bot, message).await
-        })
+        Box::pin(async move { handler.respond_default(bot, message).await })
     });
 
     let permission_filter = |bot: DefaultParseMode<Bot>, message: Message| async move {
@@ -247,9 +237,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let process_message_date = chrono::Utc::now()
-    .checked_sub_signed(chrono::Duration::try_days(1).unwrap())
-    .expect("illegal current date");
-
+        .checked_sub_signed(chrono::Duration::try_days(1).unwrap())
+        .expect("illegal current date");
 
     let time_filter = move |message: Message| {
         let boundary = process_message_date;
@@ -281,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("starting telegram bot...");
 
         let bot = Bot::with_client(base_config.bot_token.clone(), telegram_client.clone())
-        .parse_mode(ParseMode::MarkdownV2);
+            .parse_mode(ParseMode::MarkdownV2);
 
         let admin_filter_handler = handler.clone();
 
@@ -326,9 +315,11 @@ async fn main() -> anyhow::Result<()> {
         let mut bot_dispatcher = Dispatcher::builder(
             bot.clone(),
             dptree::entry()
-                .chain(dptree::filter_map(move |update: Update| match update.kind {
-                    UpdateKind::Message(x) | UpdateKind::EditedMessage(x) => Some(x),
-                    _ => None,
+                .chain(dptree::filter_map(move |update: Update| {
+                    match update.kind {
+                        UpdateKind::Message(x) | UpdateKind::EditedMessage(x) => Some(x),
+                        _ => None,
+                    }
                 }))
                 .chain(dptree::filter_map_async(time_filter))
                 .chain(dptree::filter_map_async(permission_filter))
@@ -397,11 +388,10 @@ async fn main() -> anyhow::Result<()> {
 
         tracing::info!("bot is running");
 
-        let dispatch_fut = bot_dispatcher
-            .dispatch_with_listener(
-                bot_listener,
-                LoggingErrorHandler::with_custom_text("An error from the update listener")
-            );
+        let dispatch_fut = bot_dispatcher.dispatch_with_listener(
+            bot_listener,
+            LoggingErrorHandler::with_custom_text("An error from the update listener"),
+        );
         tokio::pin!(dispatch_fut);
 
         let should_exit = tokio::select! {

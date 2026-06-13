@@ -177,15 +177,14 @@ where
             text
         );
 
-        let parsed: ApiResult<Page> =
-            serde_json::from_str(&text).map_err(|e| {
-                tracing::error!(
-                    "telegraph createPage decode failed: {}; raw body = {}",
-                    e,
-                    text
-                );
-                TelegraphError::Server
-            })?;
+        let parsed: ApiResult<Page> = serde_json::from_str(&text).map_err(|e| {
+            tracing::error!(
+                "telegraph createPage decode failed: {}; raw body = {}",
+                e,
+                text
+            );
+            TelegraphError::Server
+        })?;
 
         parsed.into()
     }

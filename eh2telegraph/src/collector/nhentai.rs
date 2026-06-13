@@ -7,14 +7,14 @@ use again::RetryPolicy;
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 use std::time::Duration;
-use tokio::time::{timeout};
+use tokio::time::timeout;
 
+use super::{AlbumMeta, Collector, ImageMeta};
 use crate::{
     http_client::{GhostClient, GhostClientBuilder},
     stream::AsyncStream,
     types::NhTag,
 };
-use super::{AlbumMeta, Collector, ImageMeta};
 
 const NHAPI: &str = "https://nhapi.cat42.uk/gallery/";
 
@@ -156,12 +156,9 @@ impl Collector for NHCollector {
 
         tracing::info!("[nhentai] sending metadata request: {}", api_url);
 
-        let resp = timeout(
-            Duration::from_secs(20),
-            client.get(&api_url).send(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("nhentai metadata request timed out"))??;
+        let resp = timeout(Duration::from_secs(20), client.get(&api_url).send())
+            .await
+            .map_err(|_| anyhow::anyhow!("nhentai metadata request timed out"))??;
 
         tracing::info!(
             "[nhentai] metadata response received: status={}",
@@ -198,17 +195,19 @@ impl Collector for NHCollector {
                 class: None,
                 description: None,
                 authors: Some(
-                    album.tags
+                    album
+                        .tags
                         .iter()
                         .filter(|t| t.tag_type == "artist" || t.tag_type == "group")
                         .map(|t| t.name.clone())
                         .collect::<Vec<_>>(),
                 ),
                 tags: Some(
-                    album.tags
+                    album
+                        .tags
                         .iter()
                         .map(|t| t.name.clone())
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>(),
                 ),
             },
             NHImageStream { image_urls },
@@ -244,7 +243,6 @@ impl ImageURL {
 pub struct NHImageStream {
     image_urls: std::vec::IntoIter<ImageURL>,
 }
-
 
 impl AsyncStream for NHImageStream {
     type Item = anyhow::Result<ImageMeta>;

@@ -9,25 +9,21 @@ use eh2telegraph::{
         ImageSearcher,
     },
     storage::KVStorage,
-    sync::{Synchronizer, SyncResult},
+    sync::{SyncResult, Synchronizer},
 };
 use reqwest::Url;
 use teloxide::{
     adaptors::DefaultParseMode,
     prelude::*,
-    utils::{
-        command::BotCommands,
-        markdown::{code_inline},
-    },
+    utils::{command::BotCommands, markdown::code_inline},
 };
 
-use tracing::{info, trace};
+use crate::{util::esc, util::PrettyChat};
 use tokio::time::{timeout, Duration};
-use crate::{util::PrettyChat, util::esc};
+use tracing::{info, trace};
 
 const MIN_SIMILARITY: u8 = 70;
 const MIN_SIMILARITY_PRIVATE: u8 = 50;
-
 
 #[derive(BotCommands, Clone)]
 #[command(
@@ -73,7 +69,6 @@ impl<C> Handler<C>
 where
     C: KVStorage<String> + Send + Sync + 'static,
 {
-
     async fn spawn_sync_reply(
         self: Arc<Self>,
         bot: DefaultParseMode<Bot>,
@@ -106,11 +101,11 @@ where
 
         tokio::spawn(async move {
             tracing::info!("[{source}] spawned sync task for {url}");
-        
+
             let text = self.sync_response(&url).await;
-        
+
             tracing::info!("[{source}] sync_response returned for {url}, editing message");
-        
+
             match timeout(Duration::from_secs(20), async {
                 bot.edit_message_text(sent.chat.id, sent.id, text).await
             })
@@ -183,9 +178,7 @@ where
                     return ControlFlow::Break(());
                 }
 
-                return self
-                    .spawn_sync_reply(bot, msg, url, "cmd handler")
-                    .await;
+                return self.spawn_sync_reply(bot, msg, url, "cmd handler").await;
             }
         };
 
@@ -209,7 +202,10 @@ where
                     }
                     Err(e) => {
                         let _ = bot
-                            .send_message(msg.chat.id, esc(&format!("Failed to delete key {key}: {e}")))
+                            .send_message(
+                                msg.chat.id,
+                                esc(&format!("Failed to delete key {key}: {e}")),
+                            )
                             .reply_to_message_id(msg.id)
                             .await;
                     }
@@ -248,9 +244,7 @@ where
         };
 
         if let Some(url) = maybe_link {
-            return self
-                .spawn_sync_reply(bot, msg, url, "text handler")
-                .await;
+            return self.spawn_sync_reply(bot, msg, url, "text handler").await;
         }
 
         // fallback to the next branch
@@ -275,17 +269,17 @@ where
                         .skip(entry.offset)
                         .take(entry.length)
                         .collect();
-                        let content = match String::from_utf16(&encoded) {
-                            Ok(content) => content,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[caption handler] failed to decode URL entity from UTF-16: {}",
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-                        Cow::from(content)
+                    let content = match String::from_utf16(&encoded) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[caption handler] failed to decode URL entity from UTF-16: {}",
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    Cow::from(content)
                 }
                 teloxide::types::MessageEntityKind::TextLink { url } => Cow::from(url.as_ref()),
                 _ => {
@@ -302,9 +296,10 @@ where
         }
 
         match final_url {
-            Some(url) => self
-                .spawn_sync_reply(bot, msg, url, "caption handler")
-                .await,
+            Some(url) => {
+                self.spawn_sync_reply(bot, msg, url, "caption handler")
+                    .await
+            }
             None => ControlFlow::Continue(()),
         }
     }

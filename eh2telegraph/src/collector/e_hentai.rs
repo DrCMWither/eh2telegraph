@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use crate::{
     http_client::{GhostClient, GhostClientBuilder},
     stream::AsyncStream,
-    util::{ get_string, match_first_group},
+    util::{get_string, match_first_group},
 };
 
 use super::{
@@ -189,7 +189,9 @@ impl EHImageStream {
             RETRY_POLICY.retry(|| async { get_string(&client, &image_page_link).await }),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("e-hentai image page request timed out: {image_page_link}"))??;
+        .map_err(|_| {
+            anyhow::anyhow!("e-hentai image page request timed out: {image_page_link}")
+        })??;
 
         let img_url = match_first_group(&IMG_RE, &content)
             .ok_or_else(|| anyhow::anyhow!("unable to find image in page: {image_page_link}"))?
