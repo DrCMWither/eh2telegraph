@@ -39,8 +39,8 @@ where
 
     #[inline]
     pub fn flush(&mut self) -> (Vec<T>, usize) {
-        let buf = std::mem::flush(&mut self.buf);
-        let size = std::mem::flush(&mut self.size);
+        let buf = std::mem::take(&mut self.buf);
+        let size = std::mem::take(&mut self.size);
         (buf, size)
     }
 
