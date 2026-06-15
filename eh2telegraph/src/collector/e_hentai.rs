@@ -4,7 +4,7 @@ use again::RetryPolicy;
 use ipnet::Ipv6Net;
 use regex::Regex;
 use reqwest::header;
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 use tokio::time::timeout;
 
 use crate::{
@@ -33,6 +33,18 @@ lazy_static::lazy_static! {
 
     static ref TITLE_RE: Regex =
         Regex::new(r#"<h1\s+id="gn">(.*?)</h1>"#).unwrap();
+
+    // E-Hentai gallery tags are rendered as rows like:
+    // <td class="tc">artist:</td><td>...<a ...>hirokawa</a>...</td>
+    static ref TAG_ROW_RE: Regex = Regex::new(
+        r#"(?is)<td\b[^>]*class=["']tc["'][^>]*>\s*([^:<]+):\s*</td>\s*<td\b[^>]*>(.*?)</td>"#
+    ).unwrap();
+
+    static ref TAG_ANCHOR_RE: Regex = Regex::new(
+        r#"(?is)<a\b[^>]*>(.*?)</a>"#
+    ).unwrap();
+
+    static ref HTML_TAG_RE: Regex = Regex::new(r#"(?is)<[^>]+>"#).unwrap();
 
     static ref RETRY_POLICY: RetryPolicy = RetryPolicy::fixed(Duration::from_millis(200))
         .with_max_retries(5)
@@ -85,6 +97,107 @@ fn parse_gallery_path(path: &str) -> anyhow::Result<(String, String)> {
             "invalid input path({path}), gallery url is expected, like https://e-hentai.org/g/2127986/da1deffea5"
         )),
     }
+}
+
+fn decode_html_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+
+        let Some(end) = rest.find(';') else {
+            out.push_str(rest);
+            return out;
+        };
+
+        let entity = &rest[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" | "#039" => Some('\''),
+            "nbsp" => Some(' '),
+            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                u32::from_str_radix(&entity[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+            }
+            _ if entity.starts_with('#') => entity[1..]
+                .parse::<u32>()
+                .ok()
+                .and_then(char::from_u32),
+            _ => None,
+        };
+
+        if let Some(ch) = decoded {
+            out.push(ch);
+            rest = &rest[end + 1..];
+        } else {
+            // Keep unknown entities unchanged.
+            out.push('&');
+            rest = &rest[1..];
+        }
+    }
+
+    out.push_str(rest);
+    out
+}
+
+fn cleanup_html_text(input: &str) -> String {
+    let no_tags = HTML_TAG_RE.replace_all(input, " ");
+    let decoded = decode_html_entities(&no_tags);
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_unique(vec: &mut Vec<String>, seen: &mut HashSet<String>, value: String) {
+    if value.is_empty() {
+        return;
+    }
+
+    let key = value.to_lowercase();
+    if seen.insert(key) {
+        vec.push(value);
+    }
+}
+
+fn parse_gallery_tags(content: &str) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    let mut authors = Vec::new();
+    let mut tags = Vec::new();
+    let mut seen_authors = HashSet::new();
+    let mut seen_tags = HashSet::new();
+
+    for row in TAG_ROW_RE.captures_iter(content) {
+        let namespace = row
+            .get(1)
+            .map(|m| cleanup_html_text(m.as_str()).to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let body = row.get(2).map(|m| m.as_str()).unwrap_or_default();
+
+        for cap in TAG_ANCHOR_RE.captures_iter(body) {
+            let label = cap
+                .get(1)
+                .map(|m| cleanup_html_text(m.as_str()))
+                .unwrap_or_default();
+
+            if label.is_empty() {
+                continue;
+            }
+
+            if namespace == "artist" || namespace == "group" {
+                push_unique(&mut authors, &mut seen_authors, label.clone());
+            }
+            push_unique(&mut tags, &mut seen_tags, label);
+        }
+    }
+
+    let authors = if authors.is_empty() { None } else { Some(authors) };
+    let tags = if tags.is_empty() { None } else { Some(tags) };
+
+    (authors, tags)
 }
 
 fn collect_image_page_links(gallery_pages: &[String]) -> Vec<String> {
@@ -140,8 +253,16 @@ impl Collector for EHCollector {
             .ok_or_else(|| anyhow::anyhow!("empty gallery page response"))?;
 
         let title = match_first_group(&TITLE_RE, first_page)
-            .map(ToOwned::to_owned)
+            .map(cleanup_html_text)
             .unwrap_or_else(|| format!("e-hentai-{album_id}"));
+
+        let (authors, tags) = parse_gallery_tags(first_page);
+
+        tracing::info!(
+            "[e-hentai] metadata parsed: authors={}, tags={}",
+            authors.as_ref().map_or(0, Vec::len),
+            tags.as_ref().map_or(0, Vec::len)
+        );
 
         let image_page_links = collect_image_page_links(&gallery_pages);
 
@@ -162,8 +283,8 @@ impl Collector for EHCollector {
                 name: title,
                 class: None,
                 description: None,
-                authors: None,
-                tags: None,
+                authors,
+                tags,
             },
             EHImageStream {
                 client,
@@ -257,10 +378,7 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn demo() {
-        let collector = EHCollector {
-            raw_client: raw_client(),
-            client: Default::default(),
-        };
+        let collector = EHCollector::new(None);
 
         let (album, mut image_stream) = collector
             .fetch("/g/2122174/fd2525031e".to_string())
@@ -298,5 +416,40 @@ mod tests {
         assert_eq!(links.len(), 2);
         assert_eq!(links[0], "https://e-hentai.org/s/bd2b37d829/2122174-7");
         assert_eq!(links[1], "https://e-hentai.org/s/4ca72f757d/2122174-8");
+    }
+
+    #[test]
+    fn parse_gallery_tags_extracts_authors_and_tags() {
+        let html = r#"
+            <div id="taglist"><table>
+              <tr>
+                <td class="tc">artist:</td>
+                <td><div><a href="/tag/artist:hirokawa">hirokawa</a></div></td>
+              </tr>
+              <tr>
+                <td class="tc">group:</td>
+                <td><div><a href="/tag/group:otonano+omochiya">otonano omochiya</a></div></td>
+              </tr>
+              <tr>
+                <td class="tc">language:</td>
+                <td><div><a href="/tag/language:chinese">chinese</a></div></td>
+              </tr>
+            </table></div>
+        "#;
+
+        let (authors, tags) = parse_gallery_tags(html);
+
+        assert_eq!(
+            authors.unwrap(),
+            vec!["hirokawa".to_string(), "otonano omochiya".to_string()]
+        );
+        assert_eq!(
+            tags.unwrap(),
+            vec![
+                "hirokawa".to_string(),
+                "otonano omochiya".to_string(),
+                "chinese".to_string()
+            ]
+        );
     }
 }

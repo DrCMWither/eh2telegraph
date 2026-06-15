@@ -15,6 +15,7 @@ use crate::{
 };
 use futures::{stream, StreamExt};
 use reqwest::header::USER_AGENT;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const ERR_THRESHOLD: usize = 10;
@@ -22,6 +23,8 @@ const DEFAULT_CONCURRENT: usize = 20;
 
 const PREWARM_CONCURRENT: usize = 8;
 const PREWARM_TIMEOUT_SECS: u64 = 30;
+
+const MESSAGE_META_CACHE_SUFFIX: &str = "|message_meta_v1";
 
 #[derive(thiserror::Error, Debug)]
 pub enum UploadError<SE> {
@@ -37,6 +40,36 @@ pub struct SyncResult {
     pub title: Option<String>,
     pub authors: Option<Vec<String>>,
     pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedMessageMeta {
+    pub title: Option<String>,
+    pub authors: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl CachedMessageMeta {
+    fn from_sync_result(result: &SyncResult) -> Self {
+        Self {
+            title: result.title.clone(),
+            authors: result.authors.clone(),
+            tags: result.tags.clone(),
+        }
+    }
+
+    fn into_sync_result(self, page_url: String) -> SyncResult {
+        SyncResult {
+            page_url,
+            title: self.title,
+            authors: self.authors,
+            tags: self.tags,
+        }
+    }
+}
+
+fn message_meta_cache_key(cache_key: &str) -> String {
+    format!("{cache_key}{MESSAGE_META_CACHE_SUFFIX}")
 }
 
 pub struct Synchronizer<C = CFStorage> {
@@ -97,6 +130,74 @@ where
         self.cache_ttl = ttl;
         self
     }
+
+    fn effective_cache_ttl(&self) -> usize {
+        self.cache_ttl.unwrap_or(Self::DEFAULT_CACHE_TTL)
+    }
+
+    async fn write_page_url_cache(&self, cache_key: &str, page_url: &str) {
+        if let Err(e) = self
+            .cache
+            .set(
+                cache_key.to_owned(),
+                page_url.to_owned(),
+                Some(self.effective_cache_ttl()),
+            )
+            .await
+        {
+            tracing::warn!("[cache] failed to write page url cache key {cache_key}: {e}");
+        }
+    }
+
+    async fn write_message_meta_cache(&self, meta_cache_key: &str, result: &SyncResult) {
+        let payload = match serde_json::to_string(&CachedMessageMeta::from_sync_result(result)) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(
+                    "[cache] failed to serialize message metadata for key {meta_cache_key}: {e}"
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = self
+            .cache
+            .set(
+                meta_cache_key.to_owned(),
+                payload,
+                Some(self.effective_cache_ttl()),
+            )
+            .await
+        {
+            tracing::warn!(
+                "[cache] failed to write message metadata cache key {meta_cache_key}: {e}"
+            );
+        }
+    }
+
+    async fn read_message_meta_cache(&self, meta_cache_key: &str) -> Option<CachedMessageMeta> {
+        let payload = match self.cache.get(meta_cache_key).await {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    "[cache] failed to read message metadata cache key {meta_cache_key}: {e}"
+                );
+                return None;
+            }
+        };
+
+        match serde_json::from_str::<CachedMessageMeta>(&payload) {
+            Ok(meta) => Some(meta),
+            Err(e) => {
+                tracing::warn!(
+                    "[cache] failed to parse message metadata cache key {meta_cache_key}: {e}"
+                );
+                None
+            }
+        }
+    }
+
     async fn prewarm_page(&self, page_url: &str, image_urls: Vec<String>) {
         tracing::info!(
             "[prewarm] fetching Telegraph page {} and {} image(s)",
@@ -155,8 +256,16 @@ where
             );
         }
     }
+
     pub async fn delete_cache(&self, key: &str) -> anyhow::Result<()> {
-        self.cache.delete(key).await
+        self.cache.delete(key).await?;
+
+        let meta_key = message_meta_cache_key(key);
+        if let Err(e) = self.cache.delete(&meta_key).await {
+            tracing::warn!("[cache] failed to delete message metadata cache key {meta_key}: {e}");
+        }
+
+        Ok(())
     }
 
     pub async fn sync<C: Collector>(&self, path: String) -> anyhow::Result<SyncResult>
@@ -169,15 +278,47 @@ where
         <C::ImageStream as AsyncStream>::Future: Send + 'static,
     {
         let cache_key = format!("{}|{}", C::name(), path);
+        let meta_cache_key = message_meta_cache_key(&cache_key);
 
-        if let Ok(Some(v)) = self.cache.get(&cache_key).await {
+        if let Ok(Some(page_url)) = self.cache.get(&cache_key).await {
             tracing::info!("[cache] hit key {cache_key}");
-            return Ok(SyncResult {
-                page_url: v,
-                title: None,
-                authors: None,
-                tags: None,
-            });
+
+            if let Some(cached_meta) = self.read_message_meta_cache(&meta_cache_key).await {
+                return Ok(cached_meta.into_sync_result(page_url));
+            }
+
+            tracing::info!(
+                "[cache] hit URL-only cache key {cache_key}; refreshing message metadata only"
+            );
+
+            let collector: &C = self.registry.get();
+            match collector.fetch(path.clone()).await {
+                Ok((meta, _stream)) => {
+                    let result = SyncResult {
+                        page_url,
+                        title: Some(meta.name),
+                        authors: meta.authors,
+                        tags: meta.tags,
+                    };
+
+                    self.write_message_meta_cache(&meta_cache_key, &result).await;
+
+                    return Ok(result);
+                }
+                Err(e) => {
+                    let err: anyhow::Error = e.into();
+                    tracing::warn!(
+                        "[cache] failed to refresh message metadata for key {cache_key}: {err}"
+                    );
+
+                    return Ok(SyncResult {
+                        page_url,
+                        title: None,
+                        authors: None,
+                        tags: None,
+                    });
+                }
+            }
         }
 
         tracing::info!("[cache] miss key {cache_key}");
@@ -194,21 +335,17 @@ where
             .await
             .map_err(anyhow::Error::from)?;
 
-        let _ = self
-            .cache
-            .set(
-                cache_key,
-                page.url.clone(),
-                Some(self.cache_ttl.unwrap_or(Self::DEFAULT_CACHE_TTL)),
-            )
-            .await;
-
-        Ok(SyncResult {
+        let result = SyncResult {
             page_url: page.url,
             title: Some(title),
             authors,
             tags,
-        })
+        };
+
+        self.write_page_url_cache(&cache_key, &result.page_url).await;
+        self.write_message_meta_cache(&meta_cache_key, &result).await;
+
+        Ok(result)
     }
 
     pub async fn sync_stream<S, SE>(
@@ -259,43 +396,57 @@ where
                     meta
                 }
             };
+
             let src = public_image_url(&self.image_proxy_base, &image_meta.url);
             tracing::info!("proxy image src = {}", src);
+
             uploaded.push(UploadedImage {
                 meta: image_meta,
                 src,
             });
         }
+
         tracing::info!("uploaded total count after loop = {}", uploaded.len());
+
         const PAGE_SIZE_LIMIT: usize = 48 * 1024;
+
         let mut chunks = Vec::with_capacity(8);
         chunks.push(Vec::new());
+
         let mut last_chunk_size = 0;
         for item in uploaded.into_iter().map(Into::<Node>::into) {
             let item_size = item.estimate_size();
+
             if last_chunk_size + item_size > PAGE_SIZE_LIMIT {
                 chunks.push(Vec::new());
                 last_chunk_size = 0;
             }
+
             last_chunk_size += item_size;
             chunks.last_mut().unwrap().push(item);
         }
 
         let mut last_page: Option<Page> = None;
         let title = meta.name.replace('|', "");
+
         while let Some(last_chunk) = chunks.pop() {
             let mut content = last_chunk;
+
             write_footer(
                 &mut content,
                 meta.link.as_str(),
                 last_page.as_ref().map(|p| p.url.as_str()),
             );
+
             let title = match chunks.len() {
                 0 => title.clone(),
                 n => format!("{}-Page{}", title, n + 1),
             };
+
             tracing::debug!("create page with content: {content:?}");
+
             let image_urls = collect_image_urls(&content);
+
             let page = self
                 .tg
                 .create_page(&PageCreate {
@@ -314,6 +465,7 @@ where
 
             last_page = Some(page);
         }
+
         Ok(last_page.unwrap())
     }
 }
@@ -364,15 +516,16 @@ fn collect_image_urls_from_node(node: &Node, urls: &mut Vec<String>) {
     }
 }
 
-
 fn write_footer(content: &mut Vec<Node>, original_link: &str, next_page: Option<&str>) {
     if let Some(page) = next_page {
         content.push(np!(na!(@page, nt!("Next Page"))));
     }
+
     content.push(np!(
         nt!("Generated by "),
         na!(@"https://github.com/DrCMWither/eh2telegraph", nt!("eh2telegraph"))
     ));
+
     content.push(np!(
         nt!("Original link: "),
         na!(@original_link, nt!(original_link))
