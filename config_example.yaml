@@ -23,6 +23,12 @@ exhentai:
   ipb_member_id: xxx
   igneous: xxx
 
+pixiv:
+  # Optional. Log in to pixiv in a browser and copy only the PHPSESSID
+  # cookie value, without the leading "PHPSESSID=". Keep it secret.
+  # When set, Pixiv API requests use the private proxy configuration above.
+  php_sessid: ""
+
 worker_kv:
   endpoint: https://kv.xxx.workers.dev
   mode: cloudflare # can be memory or auto
