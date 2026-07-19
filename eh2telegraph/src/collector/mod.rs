@@ -6,7 +6,9 @@ use std::future::Future;
 
 use crate::stream::AsyncStream;
 
-use self::{e_hentai::EHCollector, exhentai::EXCollector, nhentai::NHCollector};
+use self::{
+    e_hentai::EHCollector, exhentai::EXCollector, nhentai::NHCollector, pixiv::PixivCollector,
+};
 
 pub mod utils;
 
@@ -50,11 +52,21 @@ pub trait Collector {
     ) -> impl Future<Output = Result<(AlbumMeta, Self::ImageStream), Self::FetchError>>;
 }
 
-pub(crate) static URL_FROM_TEXT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"((https://exhentai\.org/g/\w+/[\w-]+)|(https://e-hentai\.org/g/\w+/[\w-]+)|(https://nhentai\.net/g/\d+)|(https://nhentai\.to/g/\d+))"#).unwrap()
-});
+const SUPPORTED_URL_PATTERN: &str = concat!(
+    r"((?:https://exhentai\.org/g/\w+/[\w-]+)",
+    r"|(?:https://e-hentai\.org/g/\w+/[\w-]+)",
+    r"|(?:https://nhentai\.net/g/\d+)",
+    r"|(?:https://nhentai\.to/g/\d+)",
+    r"|(?:https://(?:www\.)?pixiv\.net/(?:[a-z]{2}/)?artworks/\d+)",
+    r#"|(?:https://(?:www\.)?pixiv\.net/member_illust\.php\?[^\s#<>"]*?illust_id=\d+))"#,
+);
+
+pub(crate) static URL_FROM_TEXT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(SUPPORTED_URL_PATTERN).expect("valid supported URL regex"));
+
 pub(crate) static URL_FROM_URL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"^((https://exhentai\.org/g/\w+/[\w-]+)|(https://e-hentai\.org/g/\w+/[\w-]+)|(https://nhentai\.net/g/\d+)|(https://nhentai\.to/g/\d+))"#).unwrap()
+    Regex::new(&format!(r"^{SUPPORTED_URL_PATTERN}"))
+        .expect("valid anchored supported URL regex")
 });
 
 #[derive(Debug, Clone)]
@@ -62,6 +74,7 @@ pub struct Registry {
     eh: EHCollector,
     nh: NHCollector,
     ex: EXCollector,
+    pixiv: PixivCollector,
 }
 
 pub trait Param<T> {
@@ -86,12 +99,57 @@ impl Param<EXCollector> for Registry {
     }
 }
 
+impl Param<PixivCollector> for Registry {
+    fn get(&self) -> &PixivCollector {
+        &self.pixiv
+    }
+}
+
 impl Registry {
     pub fn new_from_config() -> Self {
         Self {
             eh: EHCollector::new_from_config().expect("unable to build e-hentai collector"),
             nh: NHCollector::new_from_config().expect("unable to build nhentai collector"),
             ex: EXCollector::new_from_config().expect("unable to build exhentai collector"),
+            pixiv: PixivCollector::new_from_config().expect("unable to build pixiv collector"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{URL_FROM_TEXT_RE, URL_FROM_URL_RE};
+
+    fn first_match<'a>(regex: &regex::Regex, input: &'a str) -> Option<&'a str> {
+        regex
+            .captures(input)
+            .and_then(|captures| captures.get(1))
+            .map(|matched| matched.as_str())
+    }
+
+    #[test]
+    fn recognizes_pixiv_artwork_urls() {
+        for url in [
+            "https://www.pixiv.net/artworks/12345678",
+            "https://pixiv.net/artworks/12345678",
+            "https://www.pixiv.net/en/artworks/12345678",
+            "https://www.pixiv.net/member_illust.php?mode=medium&illust_id=12345678",
+        ] {
+            assert_eq!(first_match(&URL_FROM_URL_RE, url), Some(url));
+        }
+    }
+
+    #[test]
+    fn extracts_pixiv_url_from_text_without_trailing_punctuation() {
+        let text = "Pixiv: https://www.pixiv.net/en/artworks/12345678).";
+        assert_eq!(
+            first_match(&URL_FROM_TEXT_RE, text),
+            Some("https://www.pixiv.net/en/artworks/12345678")
+        );
+    }
+
+    #[test]
+    fn ignores_non_artwork_pixiv_urls() {
+        assert!(first_match(&URL_FROM_TEXT_RE, "https://www.pixiv.net/users/1234").is_none());
     }
 }

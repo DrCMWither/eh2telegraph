@@ -2,7 +2,10 @@ use std::{borrow::Cow, collections::HashSet};
 use std::{ops::ControlFlow, sync::Arc};
 
 use eh2telegraph::{
-    collector::{e_hentai::EHCollector, exhentai::EXCollector, nhentai::NHCollector},
+    collector::{
+        e_hentai::EHCollector, exhentai::EXCollector, nhentai::NHCollector,
+        pixiv::PixivCollector,
+    },
     searcher::{
         f_hash::FHashConvertor,
         saucenao::{SaucenaoOutput, SaucenaoParsed, SaucenaoSearcher},
@@ -44,7 +47,7 @@ pub enum Command {
     #[command(description = "Show your account id. 显示你的账号 ID。")]
     Id,
     #[command(
-        description = "Sync a gallery(e-hentai/exhentai/nhentai are supported now). 同步一个画廊(目前支持 EH/EX/NH)"
+        description = "Sync a gallery(e-hentai/exhentai/nhentai/pixiv are supported now). 同步一个画廊(目前支持 EH/EX/NH/Pixiv)"
     )]
     Sync(String),
 }
@@ -520,6 +523,17 @@ where
                 info!("[registry] sync exhentai for path {}", path);
                 self.synchronizer
                     .sync::<EXCollector>(path)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+            "pixiv.net" | "www.pixiv.net" => {
+                let pixiv_path = match u.query() {
+                    Some(query) => format!("{path}?{query}"),
+                    None => path,
+                };
+                info!("[registry] sync pixiv for path {}", pixiv_path);
+                self.synchronizer
+                    .sync::<PixivCollector>(pixiv_path)
                     .await
                     .map_err(anyhow::Error::from)
             }
