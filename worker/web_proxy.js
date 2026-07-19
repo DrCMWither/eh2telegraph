@@ -8,7 +8,8 @@ const RESPONSE_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
   "Access-Control-Allow-Headers":
-    "X-Authorization, X-Target-URL, Content-Type, Accept, Accept-Language, Referer",
+    "X-Authorization, X-Target-URL, X-Pixiv-PHPSESSID, Content-Type, Accept, Accept-Language, Referer",
+  "Access-Control-Expose-Headers": "X-Proxy-Stage",
 };
 
 const PRIVATE_ALLOWED_HOSTS = new Set([
@@ -22,7 +23,7 @@ const PRIVATE_ALLOWED_HOSTS = new Set([
   "ehgt.org",
   "e-hentai.org",
   "exhentai.org",
-  // Pixiv AJAX API. This path is protected by X-Authorization.
+  // Pixiv AJAX API
   "www.pixiv.net",
 ]);
 
@@ -34,22 +35,25 @@ const IMAGE_ALLOWED_HOSTS = new Set([
   "ehgt.org",
   "e-hentai.org",
   "exhentai.org",
-  // Pixiv image CDN. Authentication cookies are never forwarded here.
+  // Pixiv image CDN
   "i.pximg.net",
 ]);
 
 const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_PIXIV_SESSION_LENGTH = 1024;
 const PIXIV_WEB_HOST = "www.pixiv.net";
-const PIXIV_REFERER = "https://www.pixiv.net/";
+const PIXIV_ORIGIN = "https://www.pixiv.net";
+const PIXIV_REFERER = `${PIXIV_ORIGIN}/`;
 const PIXIV_ILLUST_API_PATH = /^\/ajax\/illust\/\d+(?:\/pages)?$/;
 
-function text(status, body) {
+function text(status, body, stage = "proxy-policy") {
   return new Response(body, {
     status,
     headers: {
       ...RESPONSE_HEADERS,
       "Content-Type": "text/plain; charset=utf-8",
       "X-Content-Type-Options": "nosniff",
+      "X-Proxy-Stage": stage,
     },
   });
 }
@@ -87,6 +91,56 @@ function copyHeaderIfPresent(source, destination, name) {
   }
 }
 
+function parseLegacyPixivCookie(cookieHeader) {
+  if (!cookieHeader) {
+    return null;
+  }
+
+  const match = cookieHeader.match(/(?:^|;\s*)PHPSESSID=([^;]+)/);
+  return match ? match[1].trim() : null;
+}
+
+function readPixivSession(request) {
+  const session =
+    request.headers.get("X-Pixiv-PHPSESSID") ||
+    parseLegacyPixivCookie(request.headers.get("Cookie"));
+
+  if (!session) {
+    return null;
+  }
+
+  if (
+    session.length > MAX_PIXIV_SESSION_LENGTH ||
+    session.includes(";") ||
+    /[\r\n\0]/.test(session)
+  ) {
+    throw new Error("invalid Pixiv session header");
+  }
+
+  return session;
+}
+
+function safePixivReferer(request) {
+  const raw = request.headers.get("Referer");
+  if (!raw) {
+    return PIXIV_REFERER;
+  }
+
+  try {
+    const referer = new URL(raw);
+    if (
+      referer.protocol === "https:" &&
+      (referer.hostname === "www.pixiv.net" || referer.hostname === "pixiv.net")
+    ) {
+      return referer.toString();
+    }
+  } catch {
+    // Fall through to the fixed safe referer
+  }
+
+  return PIXIV_REFERER;
+}
+
 function buildPrivateHeaders(request, targetUrl) {
   const out = new Headers();
 
@@ -101,13 +155,21 @@ function buildPrivateHeaders(request, targetUrl) {
 
   const host = targetUrl.hostname.toLowerCase();
   if (host === PIXIV_WEB_HOST) {
-    // Only Pixiv receives the Pixiv session cookie. Do not forward cookies to
-    // the other allow-listed services by accident.
-    copyHeaderIfPresent(request.headers, out, "Cookie");
-    copyHeaderIfPresent(request.headers, out, "Referer");
+    // Construct a narrowly scoped Cookie header instead of forwarding an arbitrary Cookie string from the proxy request
+    const session = readPixivSession(request);
+    if (session) {
+      out.set("Cookie", `PHPSESSID=${session}`);
+    }
 
-    if (!out.has("Referer")) {
-      out.set("Referer", PIXIV_REFERER);
+    out.set("Referer", safePixivReferer(request));
+    out.set("Origin", PIXIV_ORIGIN);
+    out.set("X-Requested-With", "XMLHttpRequest");
+    out.set("Cache-Control", "no-cache");
+    if (!out.has("Accept")) {
+      out.set("Accept", "application/json");
+    }
+    if (!out.has("Accept-Language")) {
+      out.set("Accept-Language", "en-US,en;q=0.9,ja;q=0.8");
     }
   }
 
@@ -151,6 +213,7 @@ function buildSafeResponseHeaders(upstream, extra = {}) {
   }
 
   headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Access-Control-Expose-Headers", "X-Proxy-Stage");
   headers.set("X-Content-Type-Options", "nosniff");
 
   for (const [key, value] of Object.entries(extra)) {
@@ -190,8 +253,7 @@ async function handlePrivateProxy(request, env) {
     return text(403, `target host is not allowed: ${targetUrl.hostname}`);
   }
 
-  const isPixivTarget =
-    targetUrl.hostname.toLowerCase() === PIXIV_WEB_HOST;
+  const isPixivTarget = targetUrl.hostname.toLowerCase() === PIXIV_WEB_HOST;
 
   if (isPixivTarget) {
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -202,11 +264,18 @@ async function handlePrivateProxy(request, env) {
     }
   }
 
+  let headers;
+  try {
+    headers = buildPrivateHeaders(request, targetUrl);
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    return text(400, message);
+  }
+
   const init = {
     method: request.method,
-    headers: buildPrivateHeaders(request, targetUrl),
-    // Do not let an authenticated Pixiv request redirect its Cookie to a
-    // different host. The two allow-listed AJAX endpoints return JSON directly.
+    headers,
+    // Never allow an authenticated Pixiv request to redirect its session to a different host. The allow-listed AJAX endpoints return JSON directly.
     redirect: isPixivTarget ? "manual" : "follow",
   };
 
@@ -217,14 +286,16 @@ async function handlePrivateProxy(request, env) {
   const upstream = await fetch(targetUrl.toString(), init);
 
   if (isPixivTarget && upstream.status >= 300 && upstream.status < 400) {
-    return text(502, "unexpected pixiv redirect");
+    return text(502, "unexpected pixiv redirect", "pixiv-upstream");
   }
 
-  const headers = buildSafeResponseHeaders(upstream);
+  const headersOut = buildSafeResponseHeaders(upstream, {
+    "X-Proxy-Stage": isPixivTarget ? "pixiv-upstream" : "upstream",
+  });
 
   return new Response(upstream.body, {
     status: upstream.status,
-    headers,
+    headers: headersOut,
   });
 }
 
@@ -267,21 +338,26 @@ async function handlePublicImageProxy(request) {
   });
 
   if (!upstream.ok) {
-    return text(upstream.status, `upstream ${upstream.status}`);
+    return text(
+      upstream.status,
+      `image upstream ${upstream.status}`,
+      "image-upstream"
+    );
   }
 
   const len = upstream.headers.get("Content-Length");
   if (len && Number(len) > MAX_IMAGE_BYTES) {
-    return text(413, "image too large");
+    return text(413, "image too large", "image-upstream");
   }
 
   const contentType = upstream.headers.get("Content-Type") || "";
   if (contentType && !contentType.toLowerCase().startsWith("image/")) {
-    return text(415, "upstream is not an image");
+    return text(415, "upstream is not an image", "image-upstream");
   }
 
   const headers = buildSafeResponseHeaders(upstream, {
     "Cache-Control": "public, max-age=86400",
+    "X-Proxy-Stage": "image-upstream",
   });
 
   return new Response(upstream.body, {
@@ -311,9 +387,8 @@ export default {
     try {
       return await handleRequest(request, env);
     } catch (error) {
-      const message =
-        error && error.message ? error.message : String(error);
-      return text(500, `worker error: ${message}`);
+      const message = error && error.message ? error.message : String(error);
+      return text(500, `worker error: ${message}`, "worker-runtime");
     }
   },
 };

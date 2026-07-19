@@ -1,23 +1,42 @@
-use std::time::Duration;
+//! Pixiv collector.
+//!
+//! Supported inputs include:
+//! - `/artworks/12345678`
+//! - `https://www.pixiv.net/artworks/12345678`
+//! - `https://www.pixiv.net/en/artworks/12345678`
+//! - legacy `member_illust.php?...&illust_id=12345678`
+//!
+//! Public artworks work without authentication. If `pixiv.php_sessid` is set,
+//! Pixiv AJAX requests are made directly with that session first. The project's
+//! private HTTP proxy is only used as a fallback, preventing a proxy-side 403
+//! from breaking every Pixiv gallery. Restricted works remain accessible only
+//! when the configured Pixiv account itself has permission to view them.
+
+use std::{str::FromStr, time::Duration};
 
 use again::RetryPolicy;
 use ipnet::Ipv6Net;
-use reqwest::header::{self, HeaderMap, HeaderValue};
+use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::timeout;
 
 use crate::{
+    config,
     http_client::{GhostClient, GhostClientBuilder, HttpRequestBuilder},
+    http_proxy::ProxiedClient,
     stream::AsyncStream,
 };
 
 use super::{AlbumMeta, Collector, ImageMeta};
 
+const CONFIG_KEY: &str = "pixiv";
 const PIXIV_HOST: &str = "www.pixiv.net";
 const PIXIV_REFERER: &str = "https://www.pixiv.net/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PIXIV_SESSION_PROXY_HEADER: &str = "x-pixiv-phpsessid";
+const MAX_ERROR_BODY_CHARS: usize = 512;
 
 lazy_static::lazy_static! {
     static ref RETRY_POLICY: RetryPolicy = RetryPolicy::fixed(Duration::from_millis(250))
@@ -29,21 +48,173 @@ lazy_static::lazy_static! {
         regex::Regex::new(r"(?s)<[^>]+>").expect("valid HTML_TAG_RE");
 }
 
-#[derive(Debug, Clone)]
-pub struct PixivCollector {
-    client: GhostClient,
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PixivConfig {
+    /// The value of Pixiv's PHPSESSID cookie, without `PHPSESSID=`.
+    #[serde(default, alias = "phpsessid", alias = "PHPSESSID")]
+    pub php_sessid: Option<String>,
+
+    /// Try the configured private HTTP proxy after a direct Pixiv request fails.
+    /// Defaults to true when omitted.
+    #[serde(default)]
+    pub proxy_fallback: Option<bool>,
 }
 
-impl PixivCollector {
-    pub fn new(prefix: Option<Ipv6Net>) -> Self {
-        Self {
-            client: pixiv_client_builder().build(prefix),
+impl PixivConfig {
+    fn session_value(&self) -> anyhow::Result<Option<&str>> {
+        let Some(raw) = self.php_sessid.as_deref() else {
+            return Ok(None);
+        };
+
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+
+        let value = raw.strip_prefix("PHPSESSID=").unwrap_or(raw).trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+
+        if value.contains(';') || value.contains('\r') || value.contains('\n') {
+            return Err(anyhow::anyhow!(
+                "pixiv.php_sessid must contain only the PHPSESSID value, not a full Cookie header"
+            ));
+        }
+
+        Ok(Some(value))
+    }
+
+    fn proxy_fallback_enabled(&self) -> bool {
+        self.proxy_fallback.unwrap_or(true)
+    }
+
+    fn build_header_sets(&self) -> anyhow::Result<(HeaderMap, Option<HeaderMap>)> {
+        let session = self.session_value()?;
+        let mut direct_headers = base_headers();
+
+        let Some(session) = session else {
+            return Ok((direct_headers, None));
+        };
+
+        let session_value = HeaderValue::from_str(session)
+            .map_err(|error| anyhow::anyhow!("invalid pixiv PHPSESSID: {error}"))?;
+        let cookie_value = HeaderValue::from_str(&format!("PHPSESSID={session}"))
+            .map_err(|error| anyhow::anyhow!("invalid pixiv PHPSESSID: {error}"))?;
+
+        direct_headers.insert(header::COOKIE, cookie_value.clone());
+
+        let mut proxy_headers = base_headers();
+        proxy_headers.insert(
+            HeaderName::from_static(PIXIV_SESSION_PROXY_HEADER),
+            session_value,
+        );
+        // Backwards compatibility with older workers. The updated worker reads
+        // X-Pixiv-PHPSESSID and reconstructs a restricted Cookie header itself.
+        proxy_headers.insert(header::COOKIE, cookie_value);
+
+        Ok((direct_headers, Some(proxy_headers)))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PixivHttpClient {
+    Direct(GhostClient),
+    Proxy(ProxiedClient),
+}
+
+impl PixivHttpClient {
+    fn get_builder(&self, url: &str) -> reqwest::RequestBuilder {
+        match self {
+            Self::Direct(client) => client.get_builder(url),
+            Self::Proxy(client) => client.get_builder(url),
         }
     }
 
-    pub fn new_from_config() -> anyhow::Result<Self> {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Direct(_) => "direct connection",
+            Self::Proxy(_) => "private proxy",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PixivCollector {
+    primary: PixivHttpClient,
+    fallback: Option<PixivHttpClient>,
+    authenticated: bool,
+}
+
+impl PixivCollector {
+    /// Build an unauthenticated collector with an optional IPv6 prefix.
+    pub fn new(prefix: Option<Ipv6Net>) -> Self {
+        Self {
+            primary: PixivHttpClient::Direct(
+                GhostClientBuilder::default()
+                    .with_default_headers(base_headers())
+                    .build(prefix),
+            ),
+            fallback: None,
+            authenticated: false,
+        }
+    }
+
+    /// Build from an explicit Pixiv configuration.
+    ///
+    /// A configured session is used on a direct Pixiv client. The global proxy
+    /// is retained only as a fallback so a Worker policy/upstream 403 does not
+    /// make public and authenticated galleries fail together.
+    pub fn new_with_config(config: &PixivConfig, prefix: Option<Ipv6Net>) -> anyhow::Result<Self> {
+        let (direct_headers, proxy_headers) = config.build_header_sets()?;
+        let authenticated = proxy_headers.is_some();
+
+        let primary = PixivHttpClient::Direct(
+            GhostClientBuilder::default()
+                .with_default_headers(direct_headers)
+                .build(prefix),
+        );
+        let fallback = if config.proxy_fallback_enabled() {
+            proxy_headers.map(|headers| {
+                PixivHttpClient::Proxy(
+                    ProxiedClient::new_from_config().with_default_headers(headers),
+                )
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
-            client: pixiv_client_builder().build_from_config()?,
+            primary,
+            fallback,
+            authenticated,
+        })
+    }
+
+    pub fn new_from_config() -> anyhow::Result<Self> {
+        let pixiv_config: PixivConfig = config::parse(CONFIG_KEY)?.unwrap_or_default();
+        let (direct_headers, proxy_headers) = pixiv_config.build_header_sets()?;
+        let authenticated = proxy_headers.is_some();
+
+        let primary = PixivHttpClient::Direct(
+            GhostClientBuilder::default()
+                .with_default_headers(direct_headers)
+                .build_from_config()?,
+        );
+        let fallback = if pixiv_config.proxy_fallback_enabled() {
+            proxy_headers.map(|headers| {
+                PixivHttpClient::Proxy(
+                    ProxiedClient::new_from_config().with_default_headers(headers),
+                )
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            primary,
+            fallback,
+            authenticated,
         })
     }
 
@@ -51,26 +222,103 @@ impl PixivCollector {
     where
         T: DeserializeOwned,
     {
-        let response: PixivApiResponse = timeout(
+        match self.get_api_from(&self.primary, url, referer).await {
+            Ok(value) => Ok(value),
+            Err(primary_error) => {
+                let Some(fallback) = self.fallback.as_ref() else {
+                    return Err(primary_error);
+                };
+
+                tracing::warn!(
+                    "[pixiv] {} failed for {}: {}; trying {}",
+                    self.primary.label(),
+                    url,
+                    primary_error,
+                    fallback.label()
+                );
+
+                self.get_api_from(fallback, url, referer)
+                    .await
+                    .map_err(|fallback_error| {
+                        anyhow::anyhow!(
+                            "pixiv {} failed: {}; {} fallback failed: {}",
+                            self.primary.label(),
+                            primary_error,
+                            fallback.label(),
+                            fallback_error
+                        )
+                    })
+            }
+        }
+    }
+
+    async fn get_api_from<T>(
+        &self,
+        client: &PixivHttpClient,
+        url: &str,
+        referer: &str,
+    ) -> anyhow::Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let (status, proxy_stage, body) = timeout(
             REQUEST_TIMEOUT,
             RETRY_POLICY.retry(|| async {
-                self.client
+                let response = client
                     .get_builder(url)
                     .header(header::REFERER, referer)
                     .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<PixivApiResponse>()
-                    .await
+                    .await?;
+                let status = response.status();
+                let proxy_stage = response
+                    .headers()
+                    .get("x-proxy-stage")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let body = response.bytes().await?;
+
+                Ok::<_, reqwest::Error>((status, proxy_stage, body))
             }),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("pixiv request timed out: {url}"))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "pixiv request through {} timed out: {url}",
+                client.label()
+            )
+        })??;
+
+        if !status.is_success() {
+            let stage = proxy_stage
+                .as_deref()
+                .map(|stage| format!(", stage={stage}"))
+                .unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "HTTP {status} through {}{stage}: {}",
+                client.label(),
+                response_body_snippet(&body)
+            ));
+        }
+
+        let response: PixivApiResponse = serde_json::from_slice(&body).map_err(|error| {
+            anyhow::anyhow!(
+                "unable to parse Pixiv API response through {} from {url}: {error}; body: {}",
+                client.label(),
+                response_body_snippet(&body)
+            )
+        })?;
 
         if response.error {
             let message = response.message.trim();
+            let auth_hint = if self.authenticated {
+                "the configured Pixiv session may be expired, or its account may not have permission to view this work"
+            } else {
+                "set pixiv.php_sessid to access works that require a Pixiv login"
+            };
+
             return Err(anyhow::anyhow!(
-                "pixiv API rejected the request{}",
+                "Pixiv API rejected the request through {}{}; {auth_hint}",
+                client.label(),
                 if message.is_empty() {
                     String::new()
                 } else {
@@ -80,15 +328,22 @@ impl PixivCollector {
         }
 
         if response.body.is_null() {
-            return Err(anyhow::anyhow!("pixiv API returned an empty body: {url}"));
+            return Err(anyhow::anyhow!(
+                "Pixiv API returned an empty body through {}: {url}",
+                client.label()
+            ));
         }
 
-        serde_json::from_value(response.body)
-            .map_err(|error| anyhow::anyhow!("unable to parse pixiv API response from {url}: {error}"))
+        serde_json::from_value(response.body).map_err(|error| {
+            anyhow::anyhow!(
+                "unable to decode Pixiv API body through {} from {url}: {error}",
+                client.label()
+            )
+        })
     }
 }
 
-fn pixiv_client_builder() -> GhostClientBuilder {
+fn base_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(
@@ -96,9 +351,33 @@ fn pixiv_client_builder() -> GhostClientBuilder {
         HeaderValue::from_static("en-US,en;q=0.9,ja;q=0.8"),
     );
     headers.insert(header::REFERER, HeaderValue::from_static(PIXIV_REFERER));
-
-    GhostClientBuilder::default().with_default_headers(headers)
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://www.pixiv.net"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-requested-with"),
+        HeaderValue::from_static("XMLHttpRequest"),
+    );
+    headers
 }
+
+fn response_body_snippet(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    if text.is_empty() {
+        return "empty response body".to_owned();
+    }
+
+    let mut chars = text.chars();
+    let snippet = chars.by_ref().take(MAX_ERROR_BODY_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
 
 impl Collector for PixivCollector {
     type FetchError = anyhow::Error;
@@ -119,14 +398,22 @@ impl Collector for PixivCollector {
         let metadata_url = format!("https://{PIXIV_HOST}/ajax/illust/{illust_id}");
         let pages_url = format!("https://{PIXIV_HOST}/ajax/illust/{illust_id}/pages");
 
-        tracing::info!("[pixiv] process {original_url}");
+        tracing::info!(
+            "[pixiv] process {original_url} (authenticated={})",
+            self.authenticated
+        );
 
         let metadata: PixivIllust = self.get_api(&metadata_url, &original_url).await?;
         let pages: Vec<PixivPage> = self.get_api(&pages_url, &original_url).await?;
 
         if pages.is_empty() {
+            let reason = if self.authenticated {
+                "the artwork is unavailable or the configured account lacks access"
+            } else {
+                "the artwork may require login; configure pixiv.php_sessid"
+            };
             return Err(anyhow::anyhow!(
-                "pixiv returned no image pages for artwork {illust_id}; it may be deleted, private, restricted, or unavailable"
+                "pixiv returned no image pages for artwork {illust_id}; {reason}"
             ));
         }
 
@@ -319,7 +606,7 @@ fn validate_image_url(url: String) -> anyhow::Result<String> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("pixiv image URL has no host: {url}"))?;
 
-    if host != "i.pximg.net" && !host.ends_with(".pximg.net") {
+    if host != "i.pximg.net" {
         return Err(anyhow::anyhow!(
             "unexpected pixiv image host {host:?} in URL {url}"
         ));
@@ -429,6 +716,27 @@ mod tests {
         ] {
             assert!(parse_illust_id(input).is_err(), "accepted {input:?}");
         }
+    }
+
+    #[test]
+    fn normalize_session_value() {
+        let plain = PixivConfig {
+            php_sessid: Some("12345_deadbeef".to_owned()),
+        };
+        assert_eq!(plain.session_value().unwrap(), Some("12345_deadbeef"));
+
+        let prefixed = PixivConfig {
+            php_sessid: Some("PHPSESSID=12345_deadbeef".to_owned()),
+        };
+        assert_eq!(
+            prefixed.session_value().unwrap(),
+            Some("12345_deadbeef")
+        );
+
+        let full_cookie = PixivConfig {
+            php_sessid: Some("PHPSESSID=123; other=value".to_owned()),
+        };
+        assert!(full_cookie.session_value().is_err());
     }
 
     #[test]

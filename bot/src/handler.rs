@@ -1,5 +1,9 @@
-use std::{borrow::Cow, collections::HashSet};
-use std::{ops::ControlFlow, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fmt,
+    ops::ControlFlow,
+    sync::Arc,
+};
 
 use eh2telegraph::{
     collector::{
@@ -12,7 +16,7 @@ use eh2telegraph::{
         ImageSearcher,
     },
     storage::KVStorage,
-    sync::{SyncResult, Synchronizer},
+    sync::{StashedGallery, SyncResult, Synchronizer},
 };
 use reqwest::Url;
 use teloxide::{
@@ -22,11 +26,42 @@ use teloxide::{
 };
 
 use crate::{util::esc, util::PrettyChat};
-use tokio::time::{timeout, Duration};
+use tokio::{
+    sync::{Mutex, Notify},
+    time::{timeout, Duration},
+};
 use tracing::{info, trace};
 
 const MIN_SIMILARITY: u8 = 70;
 const MIN_SIMILARITY_PRIVATE: u8 = 50;
+const MAX_BATCH_LINKS: usize = 100;
+const MAX_BATCH_IMAGES: usize = 5000;
+
+fn push_unique_url(urls: &mut Vec<String>, url: String) {
+    if !urls.iter().any(|existing| existing == &url) {
+        urls.push(url);
+    }
+}
+
+fn collect_urls_from_text(content: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut remaining = content;
+
+    while let Some(url) = Synchronizer::match_url_from_text(remaining) {
+        push_unique_url(&mut urls, url.to_owned());
+
+        let Some(offset) = remaining.find(url) else {
+            break;
+        };
+        let next = offset + url.len();
+        if next >= remaining.len() {
+            break;
+        }
+        remaining = &remaining[next..];
+    }
+
+    urls
+}
 
 #[derive(BotCommands, Clone)]
 #[command(
@@ -50,6 +85,15 @@ pub enum Command {
         description = "Sync a gallery(e-hentai/exhentai/nhentai/pixiv are supported now). 同步一个画廊(目前支持 EH/EX/NH/Pixiv)"
     )]
     Sync(String),
+    #[command(
+        description = "Start a batch stash session. 开始批量暂存。"
+    )]
+    Batch,
+    #[command(
+        rename = "batch_end",
+        description = "Finish the current batch and publish it. 结束批量暂存并发布。"
+    )]
+    BatchEnd,
 }
 
 #[derive(BotCommands, Clone)]
@@ -59,6 +103,83 @@ pub enum AdminCommand {
     Delete(String),
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BatchKey {
+    chat_id: i64,
+    user_id: u64,
+}
+
+impl BatchKey {
+    fn from_message(msg: &Message) -> Self {
+        Self {
+            chat_id: msg.chat.id.0,
+            user_id: msg.from().map(|user| user.id.0).unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchSource {
+    EHentai,
+    ExHentai,
+    NHentai,
+    Pixiv,
+}
+
+impl BatchSource {
+    fn from_url(url: &str) -> anyhow::Result<Self> {
+        let parsed = Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid url"))?;
+        match parsed.host_str().unwrap_or_default() {
+            "e-hentai.org" => Ok(Self::EHentai),
+            "exhentai.org" => Ok(Self::ExHentai),
+            "nhentai.net" | "nhentai.to" => Ok(Self::NHentai),
+            "pixiv.net" | "www.pixiv.net" => Ok(Self::Pixiv),
+            _ => Err(anyhow::anyhow!("no matching collector")),
+        }
+    }
+}
+
+impl fmt::Display for BatchSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EHentai => "e-hentai",
+            Self::ExHentai => "exhentai",
+            Self::NHentai => "nhentai",
+            Self::Pixiv => "pixiv",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BatchQueueItem {
+    url: String,
+}
+
+#[derive(Debug)]
+struct BatchFailure {
+    url: String,
+    error: String,
+}
+
+#[derive(Debug, Default)]
+struct BatchSession {
+    source: Option<BatchSource>,
+    queue: VecDeque<BatchQueueItem>,
+    submitted_links: Vec<String>,
+    galleries: Vec<StashedGallery>,
+    failures: Vec<BatchFailure>,
+    image_count: usize,
+    processing: bool,
+    closing: bool,
+}
+
+#[derive(Debug, Default)]
+struct BatchState {
+    session: Mutex<BatchSession>,
+    changed: Notify,
+}
+
 pub struct Handler<C> {
     pub synchronizer: Synchronizer<C>,
     pub searcher: SaucenaoSearcher,
@@ -66,6 +187,7 @@ pub struct Handler<C> {
     pub admins: HashSet<i64>,
 
     single_flight: singleflight_async::SingleFlight<String>,
+    batch_sessions: Mutex<HashMap<BatchKey, Arc<BatchState>>>,
 }
 
 impl<C> Handler<C>
@@ -137,7 +259,362 @@ where
             admins,
 
             single_flight: Default::default(),
+            batch_sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn start_batch(&self, bot: &DefaultParseMode<Bot>, msg: &Message) {
+        let key = BatchKey::from_message(msg);
+        let mut sessions = self.batch_sessions.lock().await;
+
+        if let Some(state) = sessions.get(&key).cloned() {
+            drop(sessions);
+            let session = state.session.lock().await;
+            let source = session
+                .source
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| "not selected".to_owned());
+            let text = format!(
+                "Batch is already active.\nSource: {source}\nQueued: {}\nStashed galleries: {}\nCached images: {}\nUse /batch_end to publish.",
+                session.queue.len(),
+                session.galleries.len(),
+                session.image_count,
+            );
+            let _ = bot
+                .send_message(msg.chat.id, esc(&text))
+                .reply_to_message_id(msg.id)
+                .await;
+            return;
+        }
+
+        sessions.insert(key, Arc::new(BatchState::default()));
+        drop(sessions);
+
+        let _ = bot
+            .send_message(
+                msg.chat.id,
+                esc(
+                    "Batch stash started.\nSend supported gallery links. The first accepted link locks the source for this batch. Images are cached while links are processed. Use /batch_end to publish.",
+                ),
+            )
+            .reply_to_message_id(msg.id)
+            .await;
+    }
+
+    async fn enqueue_batch_urls(
+        self: &Arc<Self>,
+        bot: &DefaultParseMode<Bot>,
+        msg: &Message,
+        urls: Vec<String>,
+    ) -> bool {
+        let key = BatchKey::from_message(msg);
+        let state = {
+            let sessions = self.batch_sessions.lock().await;
+            sessions.get(&key).cloned()
+        };
+        let Some(state) = state else {
+            return false;
+        };
+
+        let mut accepted = 0usize;
+        let mut rejected = Vec::new();
+        let mut should_spawn = false;
+        let (source, queued, stashed, image_count, closing) = {
+            let mut session = state.session.lock().await;
+            if session.closing {
+                (
+                    session.source,
+                    session.queue.len(),
+                    session.galleries.len(),
+                    session.image_count,
+                    true,
+                )
+            } else {
+                for url in urls {
+                    if session.submitted_links.len() >= MAX_BATCH_LINKS {
+                        rejected.push(format!(
+                            "{url}: batch link limit {MAX_BATCH_LINKS} reached"
+                        ));
+                        continue;
+                    }
+
+                    let source = match BatchSource::from_url(&url) {
+                        Ok(source) => source,
+                        Err(error) => {
+                            rejected.push(format!("{url}: {error}"));
+                            continue;
+                        }
+                    };
+
+                    if let Some(locked) = session.source {
+                        if locked != source {
+                            rejected.push(format!(
+                                "{url}: source {source} does not match locked source {locked}"
+                            ));
+                            continue;
+                        }
+                    } else {
+                        session.source = Some(source);
+                    }
+
+                    session.submitted_links.push(url.clone());
+                    session.queue.push_back(BatchQueueItem { url });
+                    accepted += 1;
+                }
+
+                if !session.processing && !session.queue.is_empty() {
+                    session.processing = true;
+                    should_spawn = true;
+                }
+
+                (
+                    session.source,
+                    session.queue.len(),
+                    session.galleries.len(),
+                    session.image_count,
+                    false,
+                )
+            }
+        };
+
+        if should_spawn {
+            let handler = Arc::clone(self);
+            let worker_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                handler.drain_batch(key, worker_state).await;
+            });
+        }
+
+        let response = if closing {
+            "Batch is already closing; no more links are accepted.".to_owned()
+        } else {
+            let source = source
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| "not selected".to_owned());
+            let mut response = format!(
+                "Batch queue updated.\nAccepted: {accepted}\nRejected: {}\nSource: {source}\nWaiting: {queued}\nStashed galleries: {stashed}\nCached images: {image_count}",
+                rejected.len(),
+            );
+            if !rejected.is_empty() {
+                response.push_str("\nRejected details:");
+                for detail in rejected.iter().take(3) {
+                    response.push_str("\n- ");
+                    response.push_str(detail);
+                }
+                if rejected.len() > 3 {
+                    response.push_str(&format!("\n- and {} more", rejected.len() - 3));
+                }
+            }
+            response
+        };
+
+        let _ = bot
+            .send_message(msg.chat.id, esc(&response))
+            .reply_to_message_id(msg.id)
+            .await;
+        true
+    }
+
+    async fn drain_batch(self: Arc<Self>, _key: BatchKey, state: Arc<BatchState>) {
+        loop {
+            let next = {
+                let mut session = state.session.lock().await;
+                match session.queue.pop_front() {
+                    Some(item) => Some(item),
+                    None => {
+                        session.processing = false;
+                        state.changed.notify_waiters();
+                        None
+                    }
+                }
+            };
+
+            let Some(item) = next else {
+                return;
+            };
+
+            tracing::info!("[batch] stashing {}", item.url);
+            let result = self.route_stash(&item.url).await;
+
+            let mut session = state.session.lock().await;
+            match result {
+                Ok(gallery) => {
+                    let gallery_images = gallery.images.len();
+                    if session.image_count.saturating_add(gallery_images) > MAX_BATCH_IMAGES {
+                        session.failures.push(BatchFailure {
+                            url: item.url,
+                            error: format!(
+                                "batch image limit {MAX_BATCH_IMAGES} would be exceeded"
+                            ),
+                        });
+                    } else {
+                        session.image_count += gallery_images;
+                        session.galleries.push(gallery);
+                    }
+                }
+                Err(error) => {
+                    session.failures.push(BatchFailure {
+                        url: item.url,
+                        error: error.to_string(),
+                    });
+                }
+            }
+            drop(session);
+            state.changed.notify_waiters();
+        }
+    }
+
+    async fn finish_batch(
+        self: Arc<Self>,
+        bot: DefaultParseMode<Bot>,
+        msg: Message,
+    ) -> ControlFlow<()> {
+        let key = BatchKey::from_message(&msg);
+        let state = {
+            let sessions = self.batch_sessions.lock().await;
+            sessions.get(&key).cloned()
+        };
+
+        let Some(state) = state else {
+            let _ = bot
+                .send_message(msg.chat.id, esc("No active batch. Use /batch first."))
+                .reply_to_message_id(msg.id)
+                .await;
+            return ControlFlow::Break(());
+        };
+
+        {
+            let mut session = state.session.lock().await;
+            if session.closing {
+                let _ = bot
+                    .send_message(msg.chat.id, esc("This batch is already being finalized."))
+                    .reply_to_message_id(msg.id)
+                    .await;
+                return ControlFlow::Break(());
+            }
+            session.closing = true;
+        }
+
+        let sent = match bot
+            .send_message(
+                msg.chat.id,
+                esc("Finishing batch. Waiting for the stash queue to drain..."),
+            )
+            .reply_to_message_id(msg.id)
+            .await
+        {
+            Ok(sent) => sent,
+            Err(error) => {
+                tracing::error!("[batch] failed to send finalizing message: {error}");
+                let mut session = state.session.lock().await;
+                session.closing = false;
+                return ControlFlow::Break(());
+            }
+        };
+
+        tokio::spawn(async move {
+            loop {
+                let changed = state.changed.notified();
+                let finished = {
+                    let session = state.session.lock().await;
+                    !session.processing && session.queue.is_empty()
+                };
+                if finished {
+                    break;
+                }
+                changed.await;
+            }
+
+            let (galleries, submitted_links, failures, image_count, source) = {
+                let mut session = state.session.lock().await;
+                (
+                    std::mem::take(&mut session.galleries),
+                    std::mem::take(&mut session.submitted_links),
+                    std::mem::take(&mut session.failures),
+                    session.image_count,
+                    session.source,
+                )
+            };
+
+            let gallery_count = galleries.len();
+            let source_name = source
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| "not selected".to_owned());
+
+            let text = if galleries.is_empty() {
+                let mut text = format!(
+                    "Batch finished without a publishable gallery.\nSource: {source_name}\nFailed: {}",
+                    failures.len(),
+                );
+                for failure in failures.iter().take(5) {
+                    text.push_str("\n- ");
+                    text.push_str(&failure.url);
+                    text.push_str(": ");
+                    text.push_str(&failure.error);
+                }
+                text
+            } else {
+                match self
+                    .synchronizer
+                    .sync_stashed_batch(galleries, submitted_links)
+                    .await
+                {
+                    Ok(result) => {
+                        let title_line = result
+                            .title
+                            .map(|title| format!("Title: {title}\n"))
+                            .unwrap_or_default();
+                        let authors_line = result
+                            .authors
+                            .filter(|authors| !authors.is_empty())
+                            .map(|authors| format!("Authors: {}\n", authors.join(", ")))
+                            .unwrap_or_default();
+                        let tags_line = result
+                            .tags
+                            .filter(|tags| !tags.is_empty())
+                            .map(|tags| {
+                                format!(
+                                    "Tags: {}\n",
+                                    tags.into_iter()
+                                        .take(12)
+                                        .map(|tag| format!("#{}", tag.replace(' ', "_")))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                )
+                            })
+                            .unwrap_or_default();
+
+                        format!(
+                            "Batch sync finished\nSource: {source_name}\nGalleries: {gallery_count}\nCached images: {image_count}\nFailed galleries: {}\n{title_line}{authors_line}{tags_line}URL: {}",
+                            failures.len(),
+                            result.page_url,
+                        )
+                    }
+                    Err(error) => format!(
+                        "Batch publish failed.\nSource: {source_name}\nGalleries stashed: {gallery_count}\nCached images: {image_count}\nError: {error}"
+                    ),
+                }
+            };
+
+            match timeout(Duration::from_secs(20), async {
+                bot.edit_message_text(sent.chat.id, sent.id, esc(&text)).await
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::error!("[batch] failed to edit final batch message: {error}");
+                }
+                Err(_) => {
+                    tracing::error!("[batch] timeout while editing final batch message");
+                }
+            }
+
+            let mut sessions = self.batch_sessions.lock().await;
+            sessions.remove(&key);
+        });
+
+        ControlFlow::Break(())
     }
 
     /// Executed when a command comes in and parsed successfully.
@@ -181,7 +658,23 @@ where
                     return ControlFlow::Break(());
                 }
 
+                let batch_urls = collect_urls_from_text(&url);
+                let batch_urls = if batch_urls.is_empty() {
+                    vec![url.clone()]
+                } else {
+                    batch_urls
+                };
+                if self.enqueue_batch_urls(&bot, &msg, batch_urls).await {
+                    return ControlFlow::Break(());
+                }
+
                 return self.spawn_sync_reply(bot, msg, url, "cmd handler").await;
+            }
+            Command::Batch => {
+                self.start_batch(&bot, &msg).await;
+            }
+            Command::BatchEnd => {
+                return self.finish_batch(bot, msg).await;
             }
         };
 
@@ -223,35 +716,29 @@ where
         bot: DefaultParseMode<Bot>,
         msg: Message,
     ) -> ControlFlow<()> {
-        let maybe_link = {
-            let entries = msg
-                .entities()
-                .map(|es| {
-                    es.iter().filter_map(|e| {
-                        if let teloxide::types::MessageEntityKind::TextLink { url } = &e.kind {
-                            Synchronizer::match_url_from_text(url.as_ref()).map(ToOwned::to_owned)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .into_iter()
-                .flatten();
-            msg.text()
-                .and_then(|content| {
-                    Synchronizer::match_url_from_text(content).map(ToOwned::to_owned)
-                })
-                .into_iter()
-                .chain(entries)
-                .next()
-        };
+        let mut urls = msg
+            .text()
+            .map(collect_urls_from_text)
+            .unwrap_or_default();
 
-        if let Some(url) = maybe_link {
-            return self.spawn_sync_reply(bot, msg, url, "text handler").await;
+        for entity in msg.entities().map(|entities| entities.iter()).into_iter().flatten() {
+            if let teloxide::types::MessageEntityKind::TextLink { url } = &entity.kind {
+                if let Some(url) = Synchronizer::match_url_from_url(url.as_ref()) {
+                    push_unique_url(&mut urls, url.to_owned());
+                }
+            }
         }
 
-        // fallback to the next branch
-        ControlFlow::Continue(())
+        if urls.is_empty() {
+            return ControlFlow::Continue(());
+        }
+
+        if self.enqueue_batch_urls(&bot, &msg, urls.clone()).await {
+            return ControlFlow::Break(());
+        }
+
+        self.spawn_sync_reply(bot, msg, urls.remove(0), "text handler")
+            .await
     }
 
     pub async fn respond_caption(
@@ -259,52 +746,34 @@ where
         bot: DefaultParseMode<Bot>,
         msg: Message,
     ) -> ControlFlow<()> {
-        let caption_entities = msg.caption_entities();
-        let mut final_url = None;
-        for entry in caption_entities.map(|x| x.iter()).into_iter().flatten() {
-            let url = match &entry.kind {
-                teloxide::types::MessageEntityKind::Url => {
-                    let Some(raw) = msg.caption() else {
-                        return ControlFlow::Continue(());
-                    };
-                    let encoded: Vec<_> = raw
-                        .encode_utf16()
-                        .skip(entry.offset)
-                        .take(entry.length)
-                        .collect();
-                    let content = match String::from_utf16(&encoded) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            tracing::warn!(
-                                "[caption handler] failed to decode URL entity from UTF-16: {}",
-                                e
-                            );
-                            continue;
-                        }
-                    };
-                    Cow::from(content)
+        let mut urls = msg
+            .caption()
+            .map(collect_urls_from_text)
+            .unwrap_or_default();
+
+        for entity in msg
+            .caption_entities()
+            .map(|entities| entities.iter())
+            .into_iter()
+            .flatten()
+        {
+            if let teloxide::types::MessageEntityKind::TextLink { url } = &entity.kind {
+                if let Some(url) = Synchronizer::match_url_from_url(url.as_ref()) {
+                    push_unique_url(&mut urls, url.to_owned());
                 }
-                teloxide::types::MessageEntityKind::TextLink { url } => Cow::from(url.as_ref()),
-                _ => {
-                    continue;
-                }
-            };
-            let url = if let Some(c) = Synchronizer::match_url_from_url(&url) {
-                c
-            } else {
-                continue;
-            };
-            final_url = Some(url.to_string());
-            break;
+            }
         }
 
-        match final_url {
-            Some(url) => {
-                self.spawn_sync_reply(bot, msg, url, "caption handler")
-                    .await
-            }
-            None => ControlFlow::Continue(()),
+        if urls.is_empty() {
+            return ControlFlow::Continue(());
         }
+
+        if self.enqueue_batch_urls(&bot, &msg, urls.clone()).await {
+            return ControlFlow::Break(());
+        }
+
+        self.spawn_sync_reply(bot, msg, urls.remove(0), "caption handler")
+            .await
     }
 
     pub async fn respond_photo(
@@ -418,6 +887,13 @@ where
             PrettyChat(&msg.chat)
         );
 
+        if self
+            .enqueue_batch_urls(&bot, &msg, vec![url.clone()])
+            .await
+        {
+            return ControlFlow::Break(());
+        }
+
         self.spawn_sync_reply(bot, msg, url, "photo handler").await
     }
 
@@ -493,6 +969,46 @@ where
                 }
             })
             .await
+    }
+
+
+    async fn route_stash(&self, url: &str) -> anyhow::Result<StashedGallery> {
+        let parsed = Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid url"))?;
+        let host = parsed.host_str().unwrap_or_default();
+        let path = parsed.path().to_owned();
+        let source_url = url.to_owned();
+
+        match host {
+            "e-hentai.org" => {
+                info!("[registry] stash e-hentai for path {}", path);
+                self.synchronizer
+                    .stash::<EHCollector>(path, source_url)
+                    .await
+            }
+            "nhentai.to" | "nhentai.net" => {
+                info!("[registry] stash nhentai for path {}", path);
+                self.synchronizer
+                    .stash::<NHCollector>(path, source_url)
+                    .await
+            }
+            "exhentai.org" => {
+                info!("[registry] stash exhentai for path {}", path);
+                self.synchronizer
+                    .stash::<EXCollector>(path, source_url)
+                    .await
+            }
+            "pixiv.net" | "www.pixiv.net" => {
+                let pixiv_path = match parsed.query() {
+                    Some(query) => format!("{path}?{query}"),
+                    None => path,
+                };
+                info!("[registry] stash pixiv for path {}", pixiv_path);
+                self.synchronizer
+                    .stash::<PixivCollector>(pixiv_path, source_url)
+                    .await
+            }
+            _ => Err(anyhow::anyhow!("no matching collector")),
+        }
     }
 
     async fn route_sync(&self, url: &str) -> anyhow::Result<SyncResult> {

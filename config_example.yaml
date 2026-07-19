@@ -2,11 +2,12 @@ base:
   bot_token: xxx:xxxx
   admins:
     - 0
-  telegraph:
-    tokens:
-      - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-    author_name: Test Name
-    author_url: https://github.com/qini7-sese/eh2telegraph
+
+telegraph:
+  tokens:
+    - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  author_name: Test Name
+  author_url: https://github.com/qini7-sese/eh2telegraph
 
 proxy:
   endpoint: https://proxy.xxx.workers.dev/
@@ -24,10 +25,13 @@ exhentai:
   igneous: xxx
 
 pixiv:
-  # Optional. Log in to pixiv in a browser and copy only the PHPSESSID
+  # Optional. Log in to Pixiv in a browser and copy only the PHPSESSID
   # cookie value, without the leading "PHPSESSID=". Keep it secret.
-  # When set, Pixiv API requests use the private proxy configuration above.
+  # Requests use this session directly first; the private proxy is fallback only.
   php_sessid: ""
+  # Disable this when the bot host can reach Pixiv reliably and you do not want
+  # authenticated Pixiv API requests to fall back to the proxy Worker.
+  proxy_fallback: true
 
 worker_kv:
   endpoint: https://kv.xxx.workers.dev
@@ -35,4 +39,3 @@ worker_kv:
   token: xxx
   cache_size: 10240
   expire_sec: 5184000 # 60 days
-
